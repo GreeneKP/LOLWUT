@@ -9,6 +9,7 @@ pandas = "*"
 requests = "*"
 numpy = "*"
 matplotlib = "*"
+pillow = "*"
 
 [dev-packages]
 

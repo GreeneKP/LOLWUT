@@ -7,6 +7,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from io import StringIO
+from PIL import Image
+import os
 
 st.set_page_config(page_title="Live, Out of Lagrange 1, Weather Update Tool! (LOLWUT?)", page_icon="☀️", layout="wide")
 
@@ -224,10 +226,10 @@ def parse_cme_data(cme_list, flare_data_list=None):
             analyses = cme.get('cmeAnalyses', [])
             if analyses:
                 analysis = analyses[0]  # Use first analysis
-                speed = analysis.get('speed', 0)
-                half_angle = analysis.get('halfAngle', 0)
-                latitude = analysis.get('latitude', 0)
-                longitude = analysis.get('longitude', 0)
+                speed = float(analysis.get('speed', 0) or 0)
+                half_angle = float(analysis.get('halfAngle', 0) or 0)
+                latitude = float(analysis.get('latitude', 0) or 0)
+                longitude = float(analysis.get('longitude', 0) or 0)
                 
                 # Calculate full width
                 width = half_angle * 2 if half_angle else 0
@@ -251,6 +253,18 @@ def parse_cme_data(cme_list, flare_data_list=None):
                 # Format display string
                 display = f"{classification} CME - {start_time[:10]} {start_time[11:16]} UTC - {speed} km/s"
                 
+                # Calculate arrival time and impact duration
+                cme_datetime = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                arrival_hours = calculate_cme_arrival(speed)
+                if arrival_hours:
+                    arrival_time = cme_datetime + timedelta(hours=arrival_hours)
+                    impact_duration = estimate_impact_duration(speed, width)
+                    end_time = arrival_time + timedelta(hours=impact_duration)
+                else:
+                    # Default if calculation fails
+                    arrival_time = cme_datetime + timedelta(hours=48)
+                    end_time = arrival_time + timedelta(hours=24)
+                
                 parsed_cmes.append({
                     'id': cme_id,
                     'time': start_time,
@@ -264,7 +278,9 @@ def parse_cme_data(cme_list, flare_data_list=None):
                     'linked_flare_class': flare_class,
                     'linked_flare_number': flare_number,
                     'display': display,
-                    'datetime': datetime.fromisoformat(start_time.replace('Z', '+00:00')),
+                    'datetime': cme_datetime,
+                    'arrival_time': arrival_time,
+                    'end_time': end_time,
                     'linked_events': linked_events
                 })
         except Exception as e:
@@ -280,6 +296,9 @@ def fetch_noaa_data(endpoint):
     try:
         response = requests.get(f"{SWPC_BASE_URL}{endpoint}", timeout=10)
         response.raise_for_status()
+        # If it's a text file endpoint, return text instead of JSON
+        if endpoint.endswith('.txt'):
+            return response.text
         return response.json()
     except Exception as e:
         # Silently fail - errors will be handled by calling code
@@ -391,23 +410,30 @@ def plot_earth_3d(affected_start, affected_end, cme_time=None, title="Geostation
         line_z = [0, 0]
         ax.plot(line_x, line_y, line_z, 'k--', alpha=0.5, linewidth=1)
     
-    # Add Sun direction indicator based on actual time
-    # Calculate sun longitude based on time (sun appears to move ~15°/hour)
+    # Add Sun direction indicator based on CME arrival time at geostationary belt
+    # The subsolar point (where sun is directly overhead) rotates as Earth rotates
+    # At 12:00 UTC (noon), the subsolar point is at 0° longitude (Prime Meridian)
+    # Earth rotates eastward at 15° per hour, so subsolar point appears to move westward
     if cme_time is not None:
-        # Get hour angle: 360° per 24 hours = 15°/hour
-        # At noon UTC, sun is at 0° longitude (Prime Meridian)
-        # Sun moves westward (negative direction in our coordinate system)
-        hour_of_day = cme_time.hour + cme_time.minute / 60.0
-        # Sun longitude: 0° at noon UTC, moving westward 15°/hour
-        sun_longitude = -(hour_of_day - 12.0) * 15.0  # degrees from Prime Meridian
+        # Calculate hours since noon UTC (12:00)
+        hours_since_noon = (cme_time.hour - 12) + cme_time.minute / 60.0 + cme_time.second / 3600.0
+        
+        # Subsolar point moves westward at 15° per hour
+        # At 13:00 UTC (1 hour after noon), subsolar point is at -15° (15° west of Prime Meridian)
+        subsolar_longitude = -hours_since_noon * 15.0
+        
+        # The sun direction vector should point toward the subsolar point
+        # (this is where the sun is in the sky relative to Earth)
+        sun_longitude = subsolar_longitude
     else:
-        # Default: point toward negative X (historical behavior)
-        sun_longitude = 180.0
+        # Default: point toward Prime Meridian (as if it were noon)
+        sun_longitude = 0.0
     
     sun_distance = 10
     sun_rad = np.radians(sun_longitude)
-    sun_x = -sun_distance * np.cos(sun_rad)
-    sun_y = -sun_distance * np.sin(sun_rad)
+    # The vector points from Earth center toward the sun
+    sun_x = sun_distance * np.cos(sun_rad)
+    sun_y = sun_distance * np.sin(sun_rad)
     ax.quiver(0, 0, 0, sun_x, sun_y, 0, color='yellow', arrow_length_ratio=0.1, linewidth=3, label='Sun Direction')
     
     # Add cardinal direction labels on orbit
@@ -679,6 +705,239 @@ def plot_flare_geo_impact_3d(source_location, flare_class, flare_time=None, titl
     plt.tight_layout()
     return fig
 
+def fetch_satellite_charging_data(hours_before=12, hours_after=12, impact_time=None):
+    """Fetch GOES electron flux data for satellite charging analysis
+    Returns data for surface and internal charging assessment"""
+    
+    if impact_time is None:
+        impact_time = datetime.now()
+    
+    # Fetch different energy channels of electron flux
+    # >2 MeV electrons for internal charging
+    # >0.8 MeV electrons for surface charging
+    electron_data_7d = fetch_noaa_data("/json/goes/primary/differential-electrons-7-day.json")
+    electron_data_3d = fetch_noaa_data("/json/goes/primary/differential-electrons-3-day.json")
+    electron_data_1d = fetch_noaa_data("/json/goes/primary/differential-electrons-1-day.json")
+    
+    # Combine datasets
+    all_electron_data = []
+    for dataset in [electron_data_7d, electron_data_3d, electron_data_1d]:
+        if dataset and isinstance(dataset, list):
+            all_electron_data.extend(dataset)
+    
+    if not all_electron_data:
+        return None
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(all_electron_data)
+    
+    # Parse time
+    if 'time_tag' in df.columns:
+        df['time_tag'] = pd.to_datetime(df['time_tag'], utc=True).dt.tz_localize(None)
+        
+        # Filter to ±12 hours around impact
+        # Convert impact_time to timezone-naive pandas Timestamp to match DataFrame column
+        impact_timestamp = pd.Timestamp(impact_time)
+        if impact_timestamp.tz is not None:
+            impact_timestamp = impact_timestamp.replace(tzinfo=None)
+        start_time = impact_timestamp - pd.Timedelta(hours=hours_before)
+        end_time = impact_timestamp + pd.Timedelta(hours=hours_after)
+        
+        # Don't filter out future times - let the API data limits determine what's available
+        # This way we show whatever data exists, even if partial
+        filtered_df = df[(df['time_tag'] >= start_time) & (df['time_tag'] <= end_time)]
+        
+        # If no data in the exact window, try to get the closest available data
+        if filtered_df.empty:
+            # Check if data exists at all
+            if not df.empty:
+                # Find closest data points
+                closest_before = df[df['time_tag'] <= end_time]
+                closest_after = df[df['time_tag'] >= start_time]
+                if not closest_before.empty or not closest_after.empty:
+                    # Return all available data as fallback
+                    return df.sort_values('time_tag')
+            return None
+        
+        return filtered_df.sort_values('time_tag')
+    
+    return None
+
+def fetch_proton_seu_data(hours_before=12, hours_after=12, impact_time=None):
+    """Fetch GOES proton flux data for Single Event Upset (SEU) analysis
+    High energy protons (>10 MeV) can cause SEUs in satellite electronics"""
+    
+    if impact_time is None:
+        impact_time = datetime.now()
+    
+    # Fetch proton flux data at different energy levels
+    proton_data_7d = fetch_noaa_data("/json/goes/primary/differential-protons-7-day.json")
+    proton_data_3d = fetch_noaa_data("/json/goes/primary/differential-protons-3-day.json")
+    proton_data_1d = fetch_noaa_data("/json/goes/primary/differential-protons-1-day.json")
+    
+    # Combine datasets
+    all_proton_data = []
+    for dataset in [proton_data_7d, proton_data_3d, proton_data_1d]:
+        if dataset and isinstance(dataset, list):
+            all_proton_data.extend(dataset)
+    
+    if not all_proton_data:
+        return None
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(all_proton_data)
+    
+    # Parse time
+    if 'time_tag' in df.columns:
+        df['time_tag'] = pd.to_datetime(df['time_tag'], utc=True).dt.tz_localize(None)
+        
+        # Filter to ±12 hours around impact
+        # Convert impact_time to timezone-naive pandas Timestamp to match DataFrame column
+        impact_timestamp = pd.Timestamp(impact_time)
+        if impact_timestamp.tz is not None:
+            impact_timestamp = impact_timestamp.replace(tzinfo=None)
+        start_time = impact_timestamp - pd.Timedelta(hours=hours_before)
+        end_time = impact_timestamp + pd.Timedelta(hours=hours_after)
+        
+        # Don't filter out future times - let the API data limits determine what's available
+        # This way we show whatever data exists, even if partial
+        filtered_df = df[(df['time_tag'] >= start_time) & (df['time_tag'] <= end_time)]
+        
+        # If no data in the exact window, try to get the closest available data
+        if filtered_df.empty:
+            # Check if data exists at all
+            if not df.empty:
+                # Find closest data points
+                closest_before = df[df['time_tag'] <= end_time]
+                closest_after = df[df['time_tag'] >= start_time]
+                if not closest_before.empty or not closest_after.empty:
+                    # Return all available data as fallback
+                    return df.sort_values('time_tag')
+            return None
+        
+        return filtered_df.sort_values('time_tag')
+    
+    return None
+
+def plot_satellite_charging_graphs(electron_df, proton_df, impact_time, event_type="CME"):
+    """Create three graphs showing surface charging, internal charging, and SEU risk"""
+    
+    if electron_df is None and proton_df is None:
+        return None
+    
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), facecolor='black')
+    
+    # Surface Charging (lower energy electrons: 0.8-2.0 MeV)
+    ax1.set_facecolor('black')
+    if electron_df is not None and not electron_df.empty:
+        # Filter for lower energy electrons (surface charging: ~200-900 keV)
+        surface_energies = ["378 keV", "548 keV", "865 keV"]
+        for energy in surface_energies:
+            energy_data = electron_df[electron_df['energy'] == energy].copy()
+            if not energy_data.empty:
+                # Convert time_tag to datetime
+                energy_data['time_tag'] = pd.to_datetime(energy_data['time_tag'])
+                flux_data = pd.to_numeric(energy_data['flux'], errors='coerce')
+                valid_mask = flux_data.notna() & (flux_data > 0)
+                if valid_mask.any():
+                    ax1.plot(energy_data.loc[valid_mask, 'time_tag'], flux_data[valid_mask], 
+                            linewidth=2, label=energy, alpha=0.8)
+        
+        if impact_time is not None:
+            ax1.axvline(x=impact_time, color='red', linestyle='--', linewidth=2, 
+                       label=f'{event_type} Impact', alpha=0.8)
+        ax1.axhline(y=1000, color='orange', linestyle=':', linewidth=1.5, 
+                   label='Moderate Risk', alpha=0.6)
+        ax1.axhline(y=10000, color='darkred', linestyle=':', linewidth=1.5, 
+                   label='High Risk', alpha=0.6)
+    
+    ax1.set_ylabel('Electron Flux\n(e/cm²/s/sr)', color='white', fontsize=11)
+    ax1.set_title('⚡ Surface Charging Risk (0.4-0.9 MeV Electrons)', color='white', fontsize=13, pad=10)
+    ax1.set_yscale('log')
+    ax1.grid(True, alpha=0.3, color='white')
+    ax1.tick_params(colors='white')
+    for spine in ax1.spines.values():
+        spine.set_edgecolor('white')
+    legend1 = ax1.legend(fontsize=8, facecolor='black', edgecolor='white', loc='upper left')
+    for text in legend1.get_texts():
+        text.set_color('white')
+    
+    # Internal Charging (higher energy electrons: >1.5 MeV)
+    ax2.set_facecolor('black')
+    if electron_df is not None and not electron_df.empty:
+        # Filter for higher energy electrons (internal charging: >1.5 MeV)
+        internal_energies = ["1509 keV", "2205 keV", "2894 keV"]
+        for energy in internal_energies:
+            energy_data = electron_df[electron_df['energy'] == energy].copy()
+            if not energy_data.empty:
+                energy_data['time_tag'] = pd.to_datetime(energy_data['time_tag'])
+                flux_data = pd.to_numeric(energy_data['flux'], errors='coerce')
+                valid_mask = flux_data.notna() & (flux_data > 0)
+                if valid_mask.any():
+                    ax2.plot(energy_data.loc[valid_mask, 'time_tag'], flux_data[valid_mask], 
+                            linewidth=2, label=energy, alpha=0.8)
+        
+        if impact_time is not None:
+            ax2.axvline(x=impact_time, color='red', linestyle='--', linewidth=2, 
+                       label=f'{event_type} Impact', alpha=0.8)
+        ax2.axhline(y=100, color='orange', linestyle=':', linewidth=1.5, 
+                   label='Moderate Risk', alpha=0.6)
+        ax2.axhline(y=1000, color='darkred', linestyle=':', linewidth=1.5, 
+                   label='High Risk', alpha=0.6)
+    
+    ax2.set_ylabel('Electron Flux\n(e/cm²/s/sr)', color='white', fontsize=11)
+    ax2.set_title('⚡ Internal Charging Risk (>1.5 MeV Electrons)', color='white', fontsize=13, pad=10)
+    ax2.set_yscale('log')
+    ax2.grid(True, alpha=0.3, color='white')
+    ax2.tick_params(colors='white')
+    for spine in ax2.spines.values():
+        spine.set_edgecolor('white')
+    legend2 = ax2.legend(fontsize=8, facecolor='black', edgecolor='white', loc='upper left')
+    for text in legend2.get_texts():
+        text.set_color('white')
+    
+    # Single Event Upsets (high energy protons: >5 MeV)
+    ax3.set_facecolor('black')
+    if proton_df is not None and not proton_df.empty:
+        # Filter for high energy proton channels (>5 MeV for SEU)
+        seu_energies = ["5840-11000 keV", "11640-23270 keV", "25900-38100 keV", "40300-73400 keV"]
+        for energy in seu_energies:
+            energy_data = proton_df[proton_df['energy'] == energy].copy()
+            if not energy_data.empty:
+                energy_data['time_tag'] = pd.to_datetime(energy_data['time_tag'])
+                flux_data = pd.to_numeric(energy_data['flux'], errors='coerce')
+                valid_mask = flux_data.notna() & (flux_data > 0)
+                if valid_mask.any():
+                    # Simplify label
+                    label = energy.replace(" keV", "").replace("-", "-") + " keV"
+                    ax3.plot(energy_data.loc[valid_mask, 'time_tag'], flux_data[valid_mask], 
+                            linewidth=2, label=label, alpha=0.8)
+        
+        if impact_time is not None:
+            ax3.axvline(x=impact_time, color='red', linestyle='--', linewidth=2, 
+                       label=f'{event_type} Impact', alpha=0.8)
+        ax3.axhline(y=10, color='orange', linestyle=':', linewidth=1.5, 
+                   label='Moderate Risk', alpha=0.6)
+        ax3.axhline(y=100, color='darkred', linestyle=':', linewidth=1.5, 
+                   label='High Risk', alpha=0.6)
+    
+    ax3.set_ylabel('Proton Flux\n(p/cm²/s/sr)', color='white', fontsize=11)
+    ax3.set_xlabel('Time (UTC)', color='white', fontsize=11)
+    ax3.set_title('⚡ Single Event Upset Risk (>5 MeV Protons)', color='white', fontsize=13, pad=10)
+    ax3.set_yscale('log')
+    ax3.grid(True, alpha=0.3, color='white')
+    ax3.tick_params(colors='white')
+    for spine in ax3.spines.values():
+        spine.set_edgecolor('white')
+    legend3 = ax3.legend(fontsize=8, facecolor='black', edgecolor='white', loc='upper left')
+    for text in legend3.get_texts():
+        text.set_color('white')
+    
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    return fig
+
 
 # Create tabs for different views
 tab1, tab2, tab3 = st.tabs(["🌟 Current Conditions", "⚡ Solar Proton Events", "📊 Forecast & Timeline"])
@@ -691,10 +950,15 @@ with tab1:
     
     with col1:
         st.subheader("🧲 Magnetic Field")
-        mag_data = fetch_noaa_data("/products/summary/solar-wind-mag-field.json")
-        if mag_data:
-            bt = mag_data.get('Bt', 'N/A')
-            st.metric("Magnetic Field Bt (Current)", f"{bt} nT")
+        mag_data_raw = fetch_noaa_data("/products/solar-wind/mag-1-day.json")
+        if mag_data_raw and isinstance(mag_data_raw, list) and len(mag_data_raw) > 1:
+            # Array format: [time, bx, by, bz, lon, lat, bt]
+            try:
+                latest_entry = mag_data_raw[-1]
+                bt = latest_entry[6] if len(latest_entry) > 6 else 'N/A'
+                st.metric("Magnetic Field Bt (Current)", f"{bt} nT")
+            except (IndexError, TypeError):
+                st.info("Fetching magnetic field data...")
         else:
             st.info("Fetching magnetic field data...")
     
@@ -773,11 +1037,12 @@ with tab1:
     
     with col4:
         st.subheader("📡 Radio Flux")
+        # Use the summary endpoint which actually exists
         radio_json = fetch_noaa_data("/products/summary/10cm-flux.json")
         if radio_json:
             radio_flux = radio_json.get('Flux', 'N/A')
             st.metric("Solar Radio Flux", f"{radio_flux} sfu")
-            st.caption("📊 2800 MHz radio emissions")
+            st.caption("📊 2800 MHz radio emissions (10.7cm)")
         else:
             st.info("Fetching radio flux data...")
     
@@ -813,7 +1078,7 @@ with tab1:
         st.markdown("""
         **These are COMPLETELY DIFFERENT measurements:**
         
-        **☢️ X-Ray Flux (Column 1):**
+        **☢️ X-Ray Flux (Column 3):**
         - **What**: Measures solar X-ray radiation (0.1-0.8 nm wavelength)
         - **Units**: W/m² (Watts per square meter)
         - **Purpose**: Detects solar flares in real-time
@@ -835,7 +1100,14 @@ with tab1:
         - X-Ray Flux: Immediate threat indicator (flares happening NOW)
         - Radio Flux: Background activity level (predicts future flare probability)
         - High radio flux + sudden X-ray spike = Major space weather event
+        
+        **Radio Flux as a Predictive Indicator:**
+        - **Short-term (hours to 1-2 days)**: Elevated radio flux (>150 sfu) indicates active regions are present and capable of producing flares. Sudden radio bursts can precede major flares by minutes to hours.
+        - **Medium-term (2-7 days)**: Rising radio flux trends suggest growing sunspot complexity and increased flare risk as active regions rotate across the solar disk.
+        - **Long-term (weeks to months)**: Radio flux tracks the 11-year solar cycle. Values >200 sfu indicate solar maximum conditions with sustained high flare probability.
+        - **Limitation**: Radio flux shows *potential* for flares but cannot predict exact timing or location. It's a statistical indicator, not a deterministic forecast.
         """)
+
     
     st.divider()
     
@@ -858,8 +1130,52 @@ with tab1:
         xray_3d = fetch_noaa_data("/json/goes/primary/xrays-3-day.json")
         xray_7d = fetch_noaa_data("/json/goes/primary/xrays-7-day.json")
         
-        # Fetch radio flux data (solar radio flux)
-        radio_combined_raw = fetch_noaa_data("/products/10cm-flux-30-day.json")
+        # Fetch radio flux data from solar radio flux text file
+        # This provides multiple readings per day (3-4 measurements) from different observatories
+        radio_text = fetch_noaa_data("/text/solar_radio_flux.txt")
+        
+        radio_combined_raw = None
+        if radio_text and isinstance(radio_text, str):
+            # Parse the text file to extract 2800 MHz (F10.7) flux data
+            lines = radio_text.strip().split('\n')
+            radio_data = []
+            current_date = None
+            
+            for line in lines:
+                line = line.strip()
+                
+                # Check for date lines (e.g., "2026 Feb 7")
+                if len(line.split()) == 3 and line.split()[0].isdigit() and len(line.split()[0]) == 4:
+                    parts = line.split()
+                    year = parts[0]
+                    month_str = parts[1]
+                    day = parts[2]
+                    # Convert month name to number
+                    month_map = {'Jan': '01', 'Feb': '02', 'Mar': '03', 'Apr': '04', 'May': '05', 'Jun': '06',
+                                'Jul': '07', 'Aug': '08', 'Sep': '09', 'Oct': '10', 'Nov': '11', 'Dec': '12'}
+                    month = month_map.get(month_str, '01')
+                    current_date = f"{year}-{month}-{day.zfill(2)}"
+                    continue
+                
+                # Check for 2800 MHz data lines
+                if line.startswith('2800') and current_date:
+                    parts = line.split()
+                    if len(parts) >= 8:
+                        # Extract readings from different observatories at different times
+                        # Format: Freq Learmonth(0500) SanVito(1200) SagHill(1700) Penticton(1700) Penticton(2000) Palehua(2300) Penticton(2300)
+                        times = ['05:00:00', '12:00:00', '17:00:00', '17:00:00', '20:00:00', '23:00:00', '23:00:00']
+                        for i, (flux_str, time_str) in enumerate(zip(parts[1:8], times), 1):
+                            try:
+                                flux = float(flux_str)
+                                if flux > 0:  # Skip -1 (missing data)
+                                    time_tag = f"{current_date}T{time_str}Z"
+                                    radio_data.append([time_tag, flux])
+                            except (ValueError, IndexError):
+                                continue
+            
+            if radio_data:
+                radio_combined_raw = [['time_tag', 'flux']]  # Headers
+                radio_combined_raw.extend(radio_data)  # Data rows
         
         # Extract headers and combine data (skip first row which is headers)
         mag_combined = []
@@ -940,14 +1256,18 @@ with tab1:
                 df_radio_combined = df_radio_combined.sort_values('time_tag')
             
             # Filter all datasets to last 7 days for consistent display
-            cutoff_date = datetime.now() - timedelta(days=7)
-            if 'time_tag' in df_mag_combined.columns:
+            # Use the latest data point from each dataset and go back 7 days from there
+            if 'time_tag' in df_mag_combined.columns and not df_mag_combined.empty:
+                cutoff_date = df_mag_combined['time_tag'].max() - timedelta(days=7)
                 df_mag_combined = df_mag_combined[df_mag_combined['time_tag'] >= cutoff_date]
-            if 'time_tag' in df_plasma_combined.columns:
+            if 'time_tag' in df_plasma_combined.columns and not df_plasma_combined.empty:
+                cutoff_date = df_plasma_combined['time_tag'].max() - timedelta(days=7)
                 df_plasma_combined = df_plasma_combined[df_plasma_combined['time_tag'] >= cutoff_date]
-            if 'time_tag' in df_xray_combined.columns:
+            if 'time_tag' in df_xray_combined.columns and not df_xray_combined.empty:
+                cutoff_date = df_xray_combined['time_tag'].max() - timedelta(days=7)
                 df_xray_combined = df_xray_combined[df_xray_combined['time_tag'] >= cutoff_date]
-            if 'time_tag' in df_radio_combined.columns:
+            if 'time_tag' in df_radio_combined.columns and not df_radio_combined.empty:
+                cutoff_date = df_radio_combined['time_tag'].max() - timedelta(days=7)
                 df_radio_combined = df_radio_combined[df_radio_combined['time_tag'] >= cutoff_date]
             
             # Create figure with multiple y-axes
@@ -1528,6 +1848,54 @@ with tab1:
                 st.warning(f"Error processing proton density data: {str(e)}")
         else:
             st.info("Proton density data unavailable")
+    
+    # Add Geostationary Satellite Environment section with 7-day view
+    st.divider()
+    st.subheader("🛰️ Geostationary Satellite Environment (7-Day View)")
+    st.caption("Real-time particle flux data from GOES satellites showing charging and SEU risks")
+    
+    try:
+        with st.spinner("Fetching GOES particle sensor data for last 7 days..."):
+            # Fetch 7 days of data (168 hours before current time)
+            current_time = datetime.now()
+            electron_data = fetch_satellite_charging_data(hours_before=168, hours_after=0, impact_time=current_time)
+            proton_data = fetch_proton_seu_data(hours_before=168, hours_after=0, impact_time=current_time)
+        
+        if electron_data is not None or proton_data is not None:
+            charging_fig = plot_satellite_charging_graphs(electron_data, proton_data, None, event_type="Current")
+            if charging_fig:
+                st.pyplot(charging_fig)
+                plt.close()
+                
+                with st.expander("ℹ️ Understanding Satellite Charging and SEU Risk"):
+                    st.markdown("""
+                    **Surface Charging (Top Graph) - Lower Energy Electrons:**
+                    - **Energy levels measured:** 378 keV, 548 keV, 865 keV (0.4-0.9 MeV)
+                    - **Units:** Electron flux in e/cm²/s/sr (electrons per square centimeter per second per steradian)
+                    - **What it measures:** Lower-energy electrons that strike outer satellite surfaces
+                    - **Significance:** These electrons accumulate on solar panels, antennas, and sensors, causing electrostatic discharge (ESD) that can damage or degrade satellite components
+                    - **Risk levels:** >1,000 e/cm²/s/sr (moderate), >10,000 e/cm²/s/sr (high)
+                    
+                    **Internal Charging (Middle Graph) - Higher Energy Electrons:**
+                    - **Energy levels measured:** 1509 keV, 2205 keV, 2894 keV (1.5-2.9 MeV)
+                    - **Units:** Electron flux in e/cm²/s/sr
+                    - **What it measures:** Higher-energy electrons that penetrate shielding into satellite interiors
+                    - **Significance:** These electrons penetrate deep into the spacecraft structure, accumulating in dielectrics, circuit boards, and cable insulation. More dangerous than surface charging as they can cause catastrophic discharge deep inside the satellite, potentially leading to permanent damage or total loss
+                    - **Risk levels:** >100 e/cm²/s/sr (moderate), >1,000 e/cm²/s/sr (high)
+                    
+                    **Single Event Upsets - SEU (Bottom Graph) - High Energy Protons:**
+                    - **Energy levels measured:** 5.8-11 MeV, 11.6-23.3 MeV, 25.9-38.1 MeV, 40.3-73.4 MeV
+                    - **Units:** Proton flux in p/cm²/s/sr (protons per square centimeter per second per steradian)
+                    - **What it measures:** High-energy protons that can ionize paths through semiconductor circuits
+                    - **Significance:** These protons can flip binary bits in computer memory, cause logic errors, or trigger false commands. While often temporary, SEUs can cascade into system failures if not detected and corrected. Critical concern for GPS accuracy and satellite command systems
+                    - **Risk levels:** >10 p/cm²/s/sr (moderate), >100 p/cm²/s/sr (high)
+                    
+                    **Data Source:** GOES Primary Magnetospheric Particle Sensors
+                    """)
+        else:
+            st.info("GOES particle data not available for the last 7 days")
+    except Exception as e:
+        st.warning(f"Unable to fetch satellite environment data: {str(e)}")
 
 with tab2:
     st.header("⚡ Solar Proton Events (CMEs & Solar Flares)")
@@ -1917,6 +2285,225 @@ with tab2:
     else:
         st.warning("No Earth-directed solar events found in the last 90 days")
     
+    # Add CME Impact Forecast graph centered on selected CME
+    if all_events and any(e['type'] == 'CME' for e in all_events):
+        st.divider()
+        st.markdown("### 📊 CME Impact Forecast (±7 Days from Impact)")
+        st.caption("Time vs. Longitude visualization of CME impacts at geostationary orbit")
+        
+        # Get all CMEs for the forecast
+        all_cmes = [e for e in all_events if e['type'] == 'CME']
+        
+        if selected_event and selected_event['type'] == 'CME':
+            center_time = selected_event['data']['arrival_time']
+            
+            # Convert CMEs to timeline events for the forecast
+            timeline_events = []
+            for cme_event in all_cmes:
+                cme = cme_event['data']
+                arrival_time = cme['arrival_time']
+                
+                # Calculate affected longitude range
+                longitude = float(cme.get('longitude', 0) or 0)
+                width = float(cme.get('width', 0) or 0)
+                long_start = (longitude - width / 2) % 360
+                long_end = (longitude + width / 2) % 360
+                
+                # Determine event classification
+                classification = cme['classification']
+                
+                timeline_events.append({
+                    'arrival_time': arrival_time,
+                    'end_time': arrival_time + timedelta(hours=24),  # Assume 24-hour duration
+                    'long_start': long_start,
+                    'long_end': long_end,
+                    'speed': cme['speed'],
+                    'classification': classification,
+                    'scorer_class': classification.split('/')[0][:2] if '/' in classification else classification[:2] if len(classification) >= 2 else classification[0]
+                })
+            
+            # Create the forecast chart centered on selected CME impact
+            fig, ax = plt.subplots(figsize=(18, 12))
+            
+            # Color mapping for SCORER system
+            color_map = {
+                'ER': '#FF0000',
+                'R': '#FF6600',
+                'O': '#FFCC00',
+                'C': '#66CC00',
+                'S': '#00CC66'
+            }
+            
+            # Time reference is the selected CME impact time
+            reference_time = center_time
+            
+            # Calculate ±7 day window (336 hours total, from -168 to +168)
+            forecast_hours_before = 168  # 7 days before
+            forecast_hours_after = 168   # 7 days after
+            start_forecast_time = reference_time - timedelta(hours=forecast_hours_before)
+            end_forecast_time = reference_time + timedelta(hours=forecast_hours_after)
+            
+            # Load and display Blank_Map.png as background
+            try:
+                # Get the directory of the current script
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                map_path = os.path.join(script_dir, 'Blank_Map.png')
+                
+                # Load the image
+                map_img = Image.open(map_path)
+                
+                # Display the image as background
+                # Extent: [left, right, bottom, top]
+                ax.imshow(map_img, extent=[-180, 180, -forecast_hours_before, forecast_hours_after], 
+                         aspect='auto', zorder=0, alpha=0.5)
+            except Exception as e:
+                # Fallback to colored background if image not found
+                ax.set_facecolor('#E6F3FF')
+                st.warning(f"Could not load Blank_Map.png: {str(e)}")
+            
+            # Plot each CME event as a rectangle
+            for event in timeline_events:
+                # Calculate arrival time relative to reference
+                arrival_hours = (event['arrival_time'] - reference_time).total_seconds() / 3600
+                end_hours = (event['end_time'] - reference_time).total_seconds() / 3600
+                
+                # Only plot if event overlaps with ±7 day window
+                if end_hours < -forecast_hours_before or arrival_hours > forecast_hours_after:
+                    continue
+                
+                # Clip to window
+                arrival_hours = max(-forecast_hours_before, arrival_hours)
+                end_hours = min(forecast_hours_after, end_hours)
+                duration_hours = end_hours - arrival_hours
+                
+                if duration_hours <= 0:
+                    continue
+                
+                scorer_class = event['scorer_class']
+                if scorer_class and scorer_class[0].isalpha():
+                    if len(scorer_class) > 1 and scorer_class[1].isalpha():
+                        scorer_class = scorer_class[:2]
+                    else:
+                        scorer_class = scorer_class[0]
+                
+                color = color_map.get(scorer_class, '#999999')
+                
+                # Get longitude span
+                long_start = event['long_start']
+                long_end = event['long_end']
+                
+                # Convert to -180 to 180
+                def convert_longitude(lon):
+                    lon = lon % 360
+                    if lon > 180:
+                        return lon - 360
+                    return lon
+                
+                long_start_merc = convert_longitude(long_start)
+                long_end_merc = convert_longitude(long_end)
+                
+                angular_span = (long_end - long_start) % 360
+                needs_wraparound = (long_start_merc > long_end_merc and angular_span < 180) or angular_span > 180
+                
+                if not needs_wraparound:
+                    if long_start_merc <= long_end_merc:
+                        width = long_end_merc - long_start_merc
+                    else:
+                        width = (180 - long_start_merc) + (long_end_merc + 180)
+                    
+                    rect = plt.Rectangle((long_start_merc, arrival_hours), width, duration_hours,
+                                        facecolor=color, edgecolor='black', alpha=0.75, linewidth=2, zorder=5)
+                    ax.add_patch(rect)
+                    
+                    center_x = (long_start_merc + long_end_merc) / 2
+                    center_y = arrival_hours + duration_hours / 2
+                    ax.text(center_x, center_y, f"{event['classification']}\n{event['speed']} km/s",
+                           ha='center', va='center', fontsize=9, fontweight='bold',
+                           bbox=dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.9, edgecolor='black'),
+                           zorder=10)
+                else:
+                    # Wraparound case
+                    width1 = 180 - long_start_merc
+                    rect1 = plt.Rectangle((long_start_merc, arrival_hours), width1, duration_hours,
+                                         facecolor=color, edgecolor='black', alpha=0.75, linewidth=2, zorder=5)
+                    ax.add_patch(rect1)
+                    
+                    width2 = long_end_merc - (-180)
+                    rect2 = plt.Rectangle((-180, arrival_hours), width2, duration_hours,
+                                         facecolor=color, edgecolor='black', alpha=0.75, linewidth=2, zorder=5)
+                    ax.add_patch(rect2)
+                    
+                    center_y = arrival_hours + duration_hours / 2
+                    ax.text(0, center_y, f"{event['classification']}\n{event['speed']} km/s",
+                           ha='center', va='center', fontsize=9, fontweight='bold',
+                           bbox=dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.9, edgecolor='black'),
+                           zorder=10)
+            
+            # Mark center time (selected CME impact)
+            ax.axhline(y=0, color='blue', linestyle='-', linewidth=4, 
+                      label='Selected CME Impact', alpha=0.95, zorder=15)
+            
+            # Set axis properties
+            ax.set_xlim(-180, 180)
+            ax.set_xlabel('Geostationary Longitude (degrees, Prime Meridian centered)', 
+                         fontsize=14, fontweight='bold')
+            
+            ax.set_ylim(-forecast_hours_before, forecast_hours_after)
+            ax.set_ylabel('Hours from Selected CME Impact', fontsize=14, fontweight='bold')
+            
+            # Add date/time labels on right y-axis
+            ax2 = ax.twinx()
+            ax2.set_ylim(-forecast_hours_before, forecast_hours_after)
+            
+            # Create time tick labels
+            tick_hours = list(range(-forecast_hours_before, forecast_hours_after + 1, 24))
+            tick_labels = [(reference_time + timedelta(hours=h)).strftime('%a %m/%d\n%H:%M') 
+                          for h in tick_hours]
+            ax2.set_yticks(tick_hours)
+            ax2.set_yticklabels(tick_labels, fontsize=10)
+            ax2.set_ylabel('Date & Time (UTC)', fontsize=14, fontweight='bold')
+            
+            # X-axis longitude labels
+            longitude_ticks = [-180, -135, -90, -45, 0, 45, 90, 135, 180]
+            longitude_labels = ['180°\n(Date Line)', '135°W', '90°W\n(Americas)', '45°W', 
+                               '0°\n(Prime)', '45°E', '90°E\n(Asia)', '135°E', 
+                               '180°\n(Date Line)']
+            ax.set_xticks(longitude_ticks)
+            ax.set_xticklabels(longitude_labels, fontsize=11)
+            
+            ax.grid(True, alpha=0.4, linestyle='-', linewidth=0.8, color='gray', zorder=1)
+            ax.set_axisbelow(True)
+            
+            # Title
+            ax.set_title(f'CME Impact Forecast: ±7 Days from Selected Impact\nCentered on {reference_time.strftime("%m/%d %H:%M UTC")}',
+                        fontsize=16, fontweight='bold', pad=20)
+            
+            # Add color legend
+            from matplotlib.patches import Patch
+            legend_elements = [
+                Patch(facecolor='#FF0000', label='ER - Extremely Rare (≥2000 km/s)', edgecolor='black'),
+                Patch(facecolor='#FF6600', label='R - Rare (1500-1999 km/s)', edgecolor='black'),
+                Patch(facecolor='#FFCC00', label='O - Outstanding (1000-1499 km/s)', edgecolor='black'),
+                Patch(facecolor='#66CC00', label='C - Common (500-999 km/s)', edgecolor='black'),
+                Patch(facecolor='#00CC66', label='S - Slow (<500 km/s)', edgecolor='black')
+            ]
+            ax.legend(handles=legend_elements, loc='upper left', title='CME Classification (SCORER)',
+                     fontsize=11, title_fontsize=12, framealpha=0.95, edgecolor='black', fancybox=True)
+            
+            # Add region labels
+            ax.text(-105, forecast_hours_after * 1.01, 'AMERICAS', ha='center', fontsize=11, 
+                   fontweight='bold', color='darkgreen', alpha=0.7)
+            ax.text(15, forecast_hours_after * 1.01, 'EUROPE/AFRICA', ha='center', fontsize=11, 
+                   fontweight='bold', color='darkgreen', alpha=0.7)
+            ax.text(120, forecast_hours_after * 1.01, 'ASIA/PACIFIC', ha='center', fontsize=11, 
+                   fontweight='bold', color='darkblue', alpha=0.7)
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+        else:
+            st.info("Select a CME event to view its impact forecast")
+    
     # Event classification explanation
     with st.expander("ℹ️ Solar Event Classification"):
         st.markdown("""
@@ -2037,22 +2624,23 @@ with tab3:
                     forecast_hours = 168  # 7 days
                     end_forecast_time = current_time + timedelta(hours=forecast_hours)
                     
-                    # Add Mercator-style background (longitude reference grid)
-                    # Create subtle background with longitude zones
-                    for lon in range(-180, 181, 30):
-                        ax.axvline(x=lon, color='lightgray', linestyle=':', linewidth=1, alpha=0.5, zorder=0)
-                    
-                    # Add horizontal time gridlines
-                    for hour in range(0, forecast_hours + 1, 24):
-                        ax.axhline(y=hour, color='lightgray', linestyle=':', linewidth=1, alpha=0.5, zorder=0)
-                    
-                    # Add continents/regions as shaded areas (simplified Mercator reference)
-                    # Americas: -180 to -30
-                    ax.axvspan(-180, -30, facecolor='wheat', alpha=0.1, zorder=0)
-                    # Europe/Africa: -30 to 60
-                    ax.axvspan(-30, 60, facecolor='lightgreen', alpha=0.1, zorder=0)
-                    # Asia/Pacific: 60 to 180
-                    ax.axvspan(60, 180, facecolor='lightblue', alpha=0.1, zorder=0)
+                    # Load and display Blank_Map.png as background
+                    try:
+                        # Get the directory of the current script
+                        script_dir = os.path.dirname(os.path.abspath(__file__))
+                        map_path = os.path.join(script_dir, 'Blank_Map.png')
+                        
+                        # Load the image
+                        map_img = Image.open(map_path)
+                        
+                        # Display the image as background
+                        # Extent: [left, right, bottom, top]
+                        ax.imshow(map_img, extent=[-180, 180, 0, forecast_hours], 
+                                 aspect='auto', zorder=0, alpha=0.5)
+                    except Exception as e:
+                        # Fallback to colored background if image not found
+                        ax.set_facecolor('#E6F3FF')
+                        st.warning(f"Could not load Blank_Map.png: {str(e)}")
                     
                     # Plot each CME event as a rectangle
                     for event in future_events:
@@ -2262,34 +2850,241 @@ with tab3:
     forecast_text = fetch_text_data(forecast_url)
     
     if forecast_text:
-        st.text(forecast_text)
+        # Parse the forecast text to extract key metrics
+        lines = forecast_text.split('\n')
+        
+        # Extract geomagnetic activity levels, radio flux, and dates
+        geomag_activity = []
+        radio_flux = []
+        forecast_dates = []
+        
+        # Calculate forecast dates (today, tomorrow, day after)
+        today = datetime.now()
+        date_labels = [
+            (today + timedelta(days=i)).strftime('%m/%d') 
+            for i in range(3)
+        ]
+        
+        # Parse line by line looking for key patterns
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # Extract dates - look for lines with month abbreviations
+            if not forecast_dates and any(month in line for month in ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']):
+                parts = line.split()
+                temp_dates = []
+                j = 0
+                while j < len(parts) - 1:
+                    if parts[j] in ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']:
+                        try:
+                            # Check if next part looks like a day number
+                            day = parts[j+1]
+                            if day.isdigit() or day.rstrip(',').isdigit():
+                                temp_dates.append(f"{parts[j]} {day.rstrip(',')}")
+                                j += 2
+                                continue
+                        except:
+                            pass
+                    j += 1
+                if len(temp_dates) >= 3:
+                    forecast_dates = temp_dates[:3]
+            
+            # Look for Geomagnetic Activity section
+            if 'Geomagnetic Activity' in line and len(geomag_activity) < 3:
+                # Read next non-empty lines until we have 3 activities or hit another section
+                j = i + 1
+                while j < len(lines) and len(geomag_activity) < 3:
+                    check_line = lines[j].strip()
+                    j += 1
+                    
+                    # Skip empty, separator, or heading lines
+                    if not check_line or check_line.startswith(':') or check_line.startswith('-') or check_line.startswith('='):
+                        continue
+                    
+                    # Stop at next section
+                    if any(word in check_line for word in ['Rationale:', 'Energetic', 'Solar Radiation', 'Radio Flux', 'Issued']):
+                        break
+                    
+                    # Check if this line contains activity keywords
+                    line_lower = check_line.lower()
+                    has_activity = any(word in line_lower for word in ['quiet', 'unsettled', 'active', 'storm'])
+                    
+                    if has_activity:
+                        # Could be multiple values on one line (space-separated) or one value per line
+                        words = check_line.split()
+                        
+                        # If line is very short (1-3 words), might be separate entries per word
+                        if len(words) <= 3 and all(w.lower() in ['quiet', 'unsettled', 'active'] for w in words):
+                            for word in words:
+                                geomag_activity.append(word.capitalize())
+                                if len(geomag_activity) >= 3:
+                                    break
+                        else:
+                            # Treat whole line as one activity description
+                            geomag_activity.append(check_line.capitalize())
+            
+            # Look for Radio Flux section
+            if 'Radio Flux' in line and len(radio_flux) < 3:
+                # Read next lines looking for numeric values
+                j = i + 1
+                while j < len(lines) and len(radio_flux) < 3:
+                    check_line = lines[j].strip()
+                    j += 1
+                    
+                    # Skip empty or separator lines
+                    if not check_line or check_line.startswith(':') or check_line.startswith('-') or check_line.startswith('='):
+                        continue
+                    
+                    # Stop at next section
+                    if any(word in check_line for word in ['Rationale:', 'Geomagnetic', 'Solar Radiation', 'Energetic', 'Issued']):
+                        break
+                    
+                    # Try to extract numbers
+                    parts = check_line.split()
+                    for part in parts:
+                        # Remove any trailing punctuation
+                        part_clean = part.rstrip('.,;')
+                        try:
+                            val = float(part_clean)
+                            # Typical solar flux range
+                            if 60 <= val <= 400:
+                                radio_flux.append(val)
+                                if len(radio_flux) >= 3:
+                                    break
+                        except ValueError:
+                            continue
+            
+            i += 1
+        
+        # Fallback if still no data found - very aggressive search
+        if len(geomag_activity) < 3:
+            geomag_activity = []
+            for line in lines:
+                line_clean = line.strip()
+                if not line_clean:
+                    continue
+                # Look for any line that's just activity keywords
+                if line_clean.lower() in ['quiet', 'unsettled', 'active', 'quiet to unsettled', 'unsettled to active']:
+                    geomag_activity.append(line_clean.capitalize())
+                    if len(geomag_activity) >= 3:
+                        break
+        
+        if len(radio_flux) < 3:
+            radio_flux = []
+            # Search entire document for any numbers in reasonable range
+            for line in lines:
+                # Skip obvious header lines
+                if 'Radio Flux' in line or 'Forecast' in line or ':' in line:
+                    continue
+                parts = line.split()
+                for part in parts:
+                    try:
+                        val = float(part.rstrip('.,;'))
+                        if 60 <= val <= 400 and val not in radio_flux:
+                            radio_flux.append(val)
+                            if len(radio_flux) >= 3:
+                                break
+                    except:
+                        pass
+                if len(radio_flux) >= 3:
+                    break
+        
+        # If we didn't find dates, use calculated ones
+        if not forecast_dates:
+            forecast_dates = date_labels
+        elif len(forecast_dates) < 3:
+            forecast_dates = date_labels
+        
+        # Forecast probabilities
+        col3, col4 = st.columns(2)
+        
+        with col3:
+            st.markdown("### 🌪️ Geomagnetic Storm Probability")
+            
+            # These are typical probabilities - could be parsed from other NOAA sources
+            probabilities = {
+                "Day": forecast_dates[:3],
+                "G1 (Minor)": ["15%", "10%", "5%"],
+                "G2 (Moderate)": ["5%", "3%", "1%"],
+                "G3+ (Strong)": ["1%", "1%", "<1%"]
+            }
+            
+            prob_df = pd.DataFrame(probabilities)
+            
+            # Create a grouped bar chart
+            fig, ax = plt.subplots(figsize=(8, 5), facecolor='white')
+            ax.set_facecolor('white')
+            
+            days = prob_df['Day']
+            g1_vals = [float(x.strip('%')) for x in prob_df['G1 (Minor)']]
+            g2_vals = [float(x.strip('%')) for x in prob_df['G2 (Moderate)']]
+            g3_vals = [float(x.strip('%').replace('<', '')) for x in prob_df['G3+ (Strong)']]
+            
+            x = np.arange(len(days))
+            width = 0.25
+            
+            ax.bar(x - width, g1_vals, width, label='G1 (Minor)', color='#FFCC00', edgecolor='black')
+            ax.bar(x, g2_vals, width, label='G2 (Moderate)', color='#FF6600', edgecolor='black')
+            ax.bar(x + width, g3_vals, width, label='G3+ (Strong)', color='#FF0000', edgecolor='black')
+            
+            ax.set_ylabel('Probability (%)', fontsize=12, fontweight='bold')
+            ax.set_xlabel('Forecast Date', fontsize=12, fontweight='bold')
+            ax.set_title('Geomagnetic Storm Probability', fontsize=13, fontweight='bold', pad=10)
+            ax.set_xticks(x)
+            ax.set_xticklabels(days)
+            ax.legend(loc='upper right', fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+        
+        with col4:
+            st.markdown("### 📻 Radio Blackout Probability")
+            
+            blackout_probs = {
+                "Day": forecast_dates[:3],
+                "R1 (Minor)": ["40%", "40%", "35%"],
+                "R2 (Moderate)": ["15%", "15%", "10%"],
+                "R3+ (Strong)": ["5%", "5%", "5%"]
+            }
+            
+            blackout_df = pd.DataFrame(blackout_probs)
+            
+            # Create a grouped bar chart
+            fig, ax = plt.subplots(figsize=(8, 5), facecolor='white')
+            ax.set_facecolor('white')
+            
+            days = blackout_df['Day']
+            r1_vals = [float(x.strip('%')) for x in blackout_df['R1 (Minor)']]
+            r2_vals = [float(x.strip('%')) for x in blackout_df['R2 (Moderate)']]
+            r3_vals = [float(x.strip('%')) for x in blackout_df['R3+ (Strong)']]
+            
+            x = np.arange(len(days))
+            width = 0.25
+            
+            ax.bar(x - width, r1_vals, width, label='R1 (Minor)', color='#66CC00', edgecolor='black')
+            ax.bar(x, r2_vals, width, label='R2 (Moderate)', color='#FF6600', edgecolor='black')
+            ax.bar(x + width, r3_vals, width, label='R3+ (Strong)', color='#CC0000', edgecolor='black')
+            
+            ax.set_ylabel('Probability (%)', fontsize=12, fontweight='bold')
+            ax.set_xlabel('Forecast Date', fontsize=12, fontweight='bold')
+            ax.set_title('Radio Blackout Probability', fontsize=13, fontweight='bold', pad=10)
+            ax.set_xticks(x)
+            ax.set_xticklabels(days)
+            ax.legend(loc='upper right', fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+        
+        # Full forecast text in expandable section
+        with st.expander("📄 View Full NOAA Forecast Text & Rationale"):
+            st.text(forecast_text)
     else:
         st.warning("Unable to fetch NOAA forecast data")
-    
-    # Additional forecast products
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("🎯 Geomagnetic Storm Probability")
-        
-        probabilities = {
-            "Day": ["Day 1", "Day 2", "Day 3"],
-            "G1 (Minor)": ["15%", "10%", "5%"],
-            "G2 (Moderate)": ["5%", "3%", "1%"],
-            "G3 (Strong)": ["1%", "1%", "1%"]
-        }
-        st.dataframe(pd.DataFrame(probabilities), use_container_width=True)
-    
-    with col2:
-        st.subheader("📻 Radio Blackout Probability")
-        
-        blackout_probs = {
-            "Day": ["Day 1", "Day 2", "Day 3"],
-            "R1 (Minor)": ["40%", "40%", "35%"],
-            "R2 (Moderate)": ["15%", "15%", "10%"],
-            "R3 (Strong)": ["5%", "5%", "5%"]
-        }
-        st.dataframe(pd.DataFrame(blackout_probs), use_container_width=True)
 
 # Sidebar with additional info
 with st.sidebar:
