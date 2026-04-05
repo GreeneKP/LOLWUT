@@ -1098,12 +1098,34 @@ with tab1:
         # Use the summary endpoint which actually exists
         radio_json = fetch_noaa_data("/products/summary/10cm-flux.json")
         log_api_call("NOAA SWPC", "Radio Flux")
-        if radio_json and isinstance(radio_json, dict):
-            radio_flux = radio_json.get('Flux', 'N/A')
-            st.metric("Solar Radio Flux", f"{radio_flux} sfu")
-            st.caption("📊 [NOAA 10cm Radio Flux](https://www.swpc.noaa.gov)")
+        
+        # Radio flux endpoint returns either dict or array format
+        radio_flux = 'N/A'
+        if radio_json:
+            if isinstance(radio_json, dict):
+                # Dictionary format (summary endpoint)
+                radio_flux = radio_json.get('flux') or radio_json.get('Flux', 'N/A')
+            elif isinstance(radio_json, list) and len(radio_json) > 1:
+                # Array format - get headers and latest data
+                try:
+                    headers = radio_json[0]
+                    latest_data = radio_json[-1]
+                    if 'flux' in headers:
+                        flux_idx = headers.index('flux')
+                        radio_flux = latest_data[flux_idx]
+                except (IndexError, ValueError, TypeError):
+                    radio_flux = 'N/A'
+        
+        if radio_flux != 'N/A':
+            try:
+                flux_val = float(radio_flux)
+                st.metric("Solar Radio Flux", f"{flux_val:.1f} sfu")
+            except (ValueError, TypeError):
+                st.metric("Solar Radio Flux", str(radio_flux))
         else:
-            st.info("Fetching radio flux data...")
+            st.metric("Solar Radio Flux", "N/A")
+        
+        st.caption("📊 [NOAA 10cm Radio Flux](https://www.swpc.noaa.gov)")
     
     with col5:
         st.subheader("🌡️ Proton Density")
