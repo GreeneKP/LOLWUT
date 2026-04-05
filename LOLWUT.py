@@ -900,6 +900,8 @@ def plot_satellite_charging_graphs(electron_df, proton_df, impact_time, event_ty
     ax1.set_ylabel('Electron Flux\n(e/cm²/s/sr)', color='white', fontsize=11)
     ax1.set_title('⚡ Surface Charging Risk (0.4-0.9 MeV Electrons)', color='white', fontsize=13, pad=10)
     ax1.set_yscale('log')
+    # Disable mathtext to prevent parsing errors
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.1e}'))
     ax1.grid(True, alpha=0.3, color='white')
     ax1.tick_params(colors='white')
     for spine in ax1.spines.values():
@@ -934,6 +936,8 @@ def plot_satellite_charging_graphs(electron_df, proton_df, impact_time, event_ty
     ax2.set_ylabel('Electron Flux\n(e/cm²/s/sr)', color='white', fontsize=11)
     ax2.set_title('⚡ Internal Charging Risk (>1.5 MeV Electrons)', color='white', fontsize=13, pad=10)
     ax2.set_yscale('log')
+    # Disable mathtext to prevent parsing errors
+    ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.1e}'))
     ax2.grid(True, alpha=0.3, color='white')
     ax2.tick_params(colors='white')
     for spine in ax2.spines.values():
@@ -971,6 +975,8 @@ def plot_satellite_charging_graphs(electron_df, proton_df, impact_time, event_ty
     ax3.set_xlabel('Time (UTC)', color='white', fontsize=11)
     ax3.set_title('⚡ Single Event Upset Risk (>5 MeV Protons)', color='white', fontsize=13, pad=10)
     ax3.set_yscale('log')
+    # Disable mathtext to prevent parsing errors
+    ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.1e}'))
     ax3.grid(True, alpha=0.3, color='white')
     ax3.tick_params(colors='white')
     for spine in ax3.spines.values():
@@ -1433,6 +1439,8 @@ with tab1:
                                color=color4, alpha=0.7, linewidth=1.5, label='X-Ray Flux', zorder=2)
                 ax4.tick_params(axis='y', labelcolor=color4, colors='white')
                 ax4.set_yscale('log')  # Use log scale for X-ray flux
+                # Disable mathtext to prevent parsing errors with scientific notation
+                ax4.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.1e}'))
             for spine in ax4.spines.values():
                 spine.set_edgecolor('white')
             
