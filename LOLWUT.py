@@ -12,6 +12,12 @@ import os
 
 st.set_page_config(page_title="Live, Out of Lagrange 1, Weather Update Tool! (LOLWUT?)", page_icon="☀️", layout="wide")
 
+# Initialize API call tracking in session state
+if 'api_calls' not in st.session_state:
+    st.session_state.api_calls = []
+if 'feature_endpoints' not in st.session_state:
+    st.session_state.feature_endpoints = {}
+
 st.title("☀️ Live, Out of Lagrange 1, Weather Update Tool! (LOLWUT?)")
 st.markdown("Real-time solar flares and coronal mass ejections tracking")
 
@@ -24,6 +30,43 @@ NASA_DONKI_FLR_API = "https://api.nasa.gov/DONKI/FLR"
 # DEMO_KEY is limited to 30 requests per hour per IP
 # Replace with your personal key for 1000 requests per hour
 NASA_API_KEY = "W8g4oXP8B1XPG2kO291e0zfmZk6ol4h0gCwAsjO5"
+
+def log_api_call(endpoint, feature=None):
+    """Log an API call with timestamp and optional feature name"""
+    st.session_state.api_calls.append({
+        'timestamp': datetime.now(),
+        'endpoint': endpoint
+    })
+    if feature:
+        st.session_state.feature_endpoints[feature] = endpoint
+
+def get_api_calls_in_last_hours(hours=3):
+    """Get number of API calls made in the last N hours"""
+    cutoff_time = datetime.now() - timedelta(hours=hours)
+    recent_calls = [call for call in st.session_state.api_calls 
+                   if call['timestamp'] > cutoff_time]
+    return len(recent_calls)
+
+def count_this_session_calls():
+    """Estimate calls made in current session (from current run)"""
+    # Count unique endpoints in current session
+    # This estimates based on the different data sources accessed
+    endpoints = set()
+    for call in st.session_state.api_calls:
+        endpoints.add(call['endpoint'])
+    return len(endpoints)
+
+def display_endpoint_link(feature_name):
+    """Display the endpoint link for a feature if available"""
+    if feature_name in st.session_state.feature_endpoints:
+        endpoint = st.session_state.feature_endpoints[feature_name]
+        # Format endpoint as clickable link for NASA API or display as text for NOAA
+        if 'api.nasa.gov' in endpoint:
+            st.caption(f"📊 Data source: [{endpoint}]({endpoint}?api_key={NASA_API_KEY})")
+        else:
+            st.caption(f"📊 Data source: `{endpoint}`")
+    else:
+        st.caption("📊 Data source: Live API")
 
 @st.cache_data(ttl=3600)
 def fetch_historical_cmes(days=90):
@@ -40,6 +83,7 @@ def fetch_historical_cmes(days=90):
     try:
         response = requests.get(NASA_DONKI_CME_API, params=params, timeout=30)
         response.raise_for_status()
+        log_api_call(NASA_DONKI_CME_API)
         data = response.json()
         return data
     except requests.exceptions.HTTPError as e:
@@ -77,6 +121,7 @@ def fetch_historical_flares(days=90):
     try:
         response = requests.get(NASA_DONKI_FLR_API, params=params, timeout=30)
         response.raise_for_status()
+        log_api_call(NASA_DONKI_FLR_API)
         data = response.json()
         return data
     except requests.exceptions.HTTPError as e:
@@ -296,6 +341,7 @@ def fetch_noaa_data(endpoint):
     try:
         response = requests.get(f"{SWPC_BASE_URL}{endpoint}", timeout=10)
         response.raise_for_status()
+        log_api_call(f"NOAA SWPC: {endpoint}")
         # If it's a text file endpoint, return text instead of JSON
         if endpoint.endswith('.txt'):
             return response.text
@@ -951,12 +997,14 @@ with tab1:
     with col1:
         st.subheader("🧲 Magnetic Field")
         mag_data_raw = fetch_noaa_data("/products/solar-wind/mag-1-day.json")
+        log_api_call("NOAA SWPC", "Magnetic Field")
         if mag_data_raw and isinstance(mag_data_raw, list) and len(mag_data_raw) > 1:
             # Array format: [time, bx, by, bz, lon, lat, bt]
             try:
                 latest_entry = mag_data_raw[-1]
                 bt = latest_entry[6] if len(latest_entry) > 6 else 'N/A'
                 st.metric("Magnetic Field Bt (Current)", f"{bt} nT")
+                st.caption("📊 [NOAA Solar Wind Magnetometer](https://www.swpc.noaa.gov)")
             except (IndexError, TypeError):
                 st.info("Fetching magnetic field data...")
         else:
@@ -965,6 +1013,7 @@ with tab1:
     with col2:
         st.subheader("🌀 Solar Wind")  
         sw_data = fetch_noaa_data("/products/solar-wind/plasma-1-day.json")
+        log_api_call("NOAA SWPC", "Solar Wind")
         if sw_data and isinstance(sw_data, list) and len(sw_data) > 1:
             # NOAA returns array: [headers, data_row1, data_row2, ...]
             # Most recent data is typically the last row
@@ -982,6 +1031,7 @@ with tab1:
                         speed_val = float(speed)
                         if speed_val > 0 and speed_val < 5000:  # Reasonable range
                             st.metric("Solar Wind Speed (Current)", f"{speed_val:.0f} km/s")
+                            st.caption("📊 [NOAA Plasma Data](https://www.swpc.noaa.gov)")
                         else:
                             st.metric("Solar Wind Speed (Current)", "N/A")
                             st.caption("⚠️ Invalid reading")
@@ -1001,6 +1051,7 @@ with tab1:
         xray_data = fetch_noaa_data("/json/goes/primary/xrays-6-hour.json")
         if not xray_data:
             xray_data = fetch_noaa_data("/json/goes/secondary/xrays-6-hour.json")
+        log_api_call("NOAA SWPC", "X-Ray Flux")
         
         if xray_data and isinstance(xray_data, list) and len(xray_data) > 1:
             try:
@@ -1024,6 +1075,7 @@ with tab1:
                             else:
                                 flare_class = "Quiet"
                             st.metric("X-Ray Flux (GOES)", f"{flux_num:.2e} W/m²", delta=flare_class)
+                            st.caption("📊 [NOAA GOES X-rays](https://www.swpc.noaa.gov)")
                         except:
                             st.metric("X-Ray Flux (GOES)", "N/A")
                     else:
@@ -1039,16 +1091,18 @@ with tab1:
         st.subheader("📡 Radio Flux")
         # Use the summary endpoint which actually exists
         radio_json = fetch_noaa_data("/products/summary/10cm-flux.json")
-        if radio_json:
+        log_api_call("NOAA SWPC", "Radio Flux")
+        if radio_json and isinstance(radio_json, dict):
             radio_flux = radio_json.get('Flux', 'N/A')
             st.metric("Solar Radio Flux", f"{radio_flux} sfu")
-            st.caption("📊 2800 MHz radio emissions (10.7cm)")
+            st.caption("📊 [NOAA 10cm Radio Flux](https://www.swpc.noaa.gov)")
         else:
             st.info("Fetching radio flux data...")
     
     with col5:
         st.subheader("🌡️ Proton Density")
         sw_data_density = fetch_noaa_data("/products/solar-wind/plasma-1-day.json")
+        log_api_call("NOAA SWPC", "Proton Density")
         if sw_data_density and isinstance(sw_data_density, list) and len(sw_data_density) > 1:
             try:
                 headers = sw_data_density[0]
@@ -1060,6 +1114,7 @@ with tab1:
                         density_val = float(density)
                         if density_val > 0 and density_val < 1000:
                             st.metric("Proton Density (Current)", f"{density_val:.1f} p/cm³")
+                            st.caption("📊 [NOAA Plasma Data](https://www.swpc.noaa.gov)")
                         else:
                             st.metric("Proton Density (Current)", "N/A")
                     except (ValueError, TypeError):
@@ -1421,6 +1476,7 @@ with tab1:
             plt.close()
             
             st.caption("📊 **Combined view:** Shows how magnetic field strength, solar wind speed, proton density, and X-ray flux interact over time. **Shaded regions** indicate times when 2 or more metrics exceed geomagnetic storm thresholds simultaneously - darker shading means more factors are elevated, indicating higher geomagnetic storm likelihood.")
+            st.caption("📡 Data sources: [NOAA Solar Wind Mag](https://www.swpc.noaa.gov) | [NOAA Plasma](https://www.swpc.noaa.gov) | [NOAA X-rays](https://www.swpc.noaa.gov) | [NOAA Radio Flux](https://www.swpc.noaa.gov)")
         except Exception as e:
             st.warning(f"Could not create combined graph: {str(e)}")
     
@@ -1489,6 +1545,7 @@ with tab1:
                             plt.tight_layout()
                             st.pyplot(fig)
                             plt.close()
+                            st.caption("📊 [NOAA Solar Wind Magnetometer](https://www.swpc.noaa.gov)")
                             
                             # Add explanatory text
                             st.caption("""
@@ -1572,6 +1629,7 @@ with tab1:
                             plt.tight_layout()
                             st.pyplot(fig)
                             plt.close()
+                            st.caption("📊 [NOAA Solar Wind Plasma](https://www.swpc.noaa.gov)")
                             
                             # Add explanatory text
                             st.caption("""
@@ -1656,6 +1714,7 @@ with tab1:
                             plt.tight_layout()
                             st.pyplot(fig)
                             plt.close()
+                            st.caption("📊 [NOAA GOES X-Ray Data](https://www.swpc.noaa.gov)")
                             
                             # Add explanatory text
                             st.caption("""
@@ -1733,6 +1792,7 @@ with tab1:
                         plt.tight_layout()
                         st.pyplot(fig)
                         plt.close()
+                        st.caption("📊 [NOAA Solar Radio Flux](https://www.swpc.noaa.gov)")
                         
                         # Stats
                         current_flux = df_radio['flux'].iloc[-1]
@@ -1827,6 +1887,7 @@ with tab1:
                             plt.tight_layout()
                             st.pyplot(fig)
                             plt.close()
+                            st.caption("📊 [NOAA Solar Wind Plasma](https://www.swpc.noaa.gov)")
                             
                             # Add explanatory text
                             st.caption("""
@@ -2501,6 +2562,7 @@ with tab2:
             plt.tight_layout()
             st.pyplot(fig)
             plt.close()
+            st.caption("📊 [NASA DONKI CME Database](https://api.nasa.gov/DONKI/CME)")
         else:
             st.info("Select a CME event to view its impact forecast")
     
@@ -2804,6 +2866,7 @@ with tab3:
                     plt.tight_layout()
                     st.pyplot(fig)
                     plt.close()
+                    st.caption("📊 [NASA DONKI CME Database](https://api.nasa.gov/DONKI/CME)")
                     
                     st.caption("📊 **How to read this chart:** Each colored box shows when (vertical span) and where (horizontal span) CMEs will impact the geostationary belt. " +
                               "| 💙 Blue line at bottom = NOW | " +
@@ -3039,6 +3102,7 @@ with tab3:
             plt.tight_layout()
             st.pyplot(fig)
             plt.close()
+            st.caption("📊 [NOAA Space Weather Forecast](https://www.swpc.noaa.gov)")
         
         with col4:
             st.markdown("### 📻 Radio Blackout Probability")
@@ -3079,6 +3143,7 @@ with tab3:
             plt.tight_layout()
             st.pyplot(fig)
             plt.close()
+            st.caption("📊 [NOAA Space Weather Forecast](https://www.swpc.noaa.gov)")
         
         # Full forecast text in expandable section
         with st.expander("📄 View Full NOAA Forecast Text & Rationale"):
@@ -3090,18 +3155,43 @@ with tab3:
 with st.sidebar:
     st.header("ℹ️ About")
     
-    # API Key Status
-    if NASA_API_KEY == "DEMO_KEY":
-        st.warning("⚠️ Using DEMO_KEY (30 req/hour limit)")
-        st.info("""
-        **Get unlimited access:**
-        1. Visit [api.nasa.gov](https://api.nasa.gov)
-        2. Get your FREE API key
-        3. Update line 20 in the code
-        4. Enjoy 1,000 requests/hour!
-        """)
-    else:
-        st.success("✅ Using personal NASA API key")
+    # Create two columns for API Key Status and Call Statistics
+    api_col1, api_col2 = st.columns(2)
+    
+    with api_col1:
+        # API Key Status
+        if NASA_API_KEY == "DEMO_KEY":
+            st.warning("⚠️ Using DEMO_KEY")
+        else:
+            st.success("✅ Using personal key")
+    
+    with api_col2:
+        # API Call Statistics
+        calls_last_3h = get_api_calls_in_last_hours(3)
+        st.metric("Calls (3h)", calls_last_3h)
+    
+    # Show calls used in this session
+    session_calls = count_this_session_calls()
+    st.caption(f"📊 This session: ~{session_calls} unique endpoints called")
+    
+    # Show API key details in expandable section
+    with st.expander("🔑 API Key Details", expanded=False):
+        if NASA_API_KEY == "DEMO_KEY":
+            st.info("""
+            **Current**: DEMO_KEY (30 req/hour limit)
+            
+            **Get unlimited access:**
+            1. Visit [api.nasa.gov](https://api.nasa.gov)
+            2. Get your FREE API key
+            3. Update line 20 in the code
+            4. Enjoy 1,000 requests/hour!
+            """)
+        else:
+            st.success("""
+            **Current**: Personal NASA API key
+            
+            Limit: 1,000 requests/hour
+            """)
     
     st.divider()
     
