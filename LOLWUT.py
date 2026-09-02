@@ -9,6 +9,7 @@ from mpl_toolkits.mplot3d import Axes3D
 from io import StringIO
 from PIL import Image
 import os
+import time
 
 st.set_page_config(page_title="Live, Out of Lagrange 1, Weather Update Tool! (LOLWUT?)", page_icon="☀️", layout="wide")
 
@@ -68,6 +69,28 @@ def display_endpoint_link(feature_name):
     else:
         st.caption("📊 Data source: Live API")
 
+def fetch_nasa_donki(url, params, max_retries=3, backoff_seconds=5):
+    """GET against NASA's DONKI API with retries for transient failures (connection
+    errors, timeouts, 5xx - confirmed to happen intermittently on this API). A 429
+    (rate limit) is NOT retried: it's re-raised immediately so the caller's existing
+    rate-limit-specific handling still runs instead of burning retries on a request
+    that will just get rate limited again."""
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                raise
+            last_exception = e
+        except requests.exceptions.RequestException as e:
+            last_exception = e
+        if attempt < max_retries - 1:
+            time.sleep(backoff_seconds)
+    raise last_exception
+
 @st.cache_data(ttl=3600)
 def fetch_historical_cmes(days=90):
     """Fetch historical CME data from NASA DONKI API"""
@@ -81,8 +104,7 @@ def fetch_historical_cmes(days=90):
     }
     
     try:
-        response = requests.get(NASA_DONKI_CME_API, params=params, timeout=30)
-        response.raise_for_status()
+        response = fetch_nasa_donki(NASA_DONKI_CME_API, params)
         log_api_call(NASA_DONKI_CME_API)
         data = response.json()
         return data
@@ -119,8 +141,7 @@ def fetch_historical_flares(days=90):
     }
     
     try:
-        response = requests.get(NASA_DONKI_FLR_API, params=params, timeout=30)
-        response.raise_for_status()
+        response = fetch_nasa_donki(NASA_DONKI_FLR_API, params)
         log_api_call(NASA_DONKI_FLR_API)
         data = response.json()
         return data
@@ -360,6 +381,39 @@ def fetch_text_data(url):
         st.error(f"Error fetching data: {str(e)}")
         return None
 
+#NOAA retired the old /products/solar-wind/mag-*.json and plasma-*.json product line
+#(now returns 404) in favor of /json/rtsw/ (near-real-time, ~2.4 days of 1-minute data)
+#and /json/ace/ (hourly archive, ~31 days). Both new sources return a list of dicts
+#instead of the old [headers, row1, row2, ...] array format, and are ordered newest-first
+#instead of oldest-first. The functions below fetch from the new sources and normalize
+#field names (proton_speed -> speed, proton_density/dens -> density) so the rest of this
+#app can keep treating 'bt', 'speed', and 'density' as the field names to look for.
+
+def fetch_mag_data():
+    """Near-real-time magnetometer readings (~2.4 days), replacing the retired mag-1-day.json."""
+    return fetch_noaa_data("/json/rtsw/rtsw_mag_1m.json")
+
+def fetch_plasma_data():
+    """Near-real-time solar wind plasma readings (~2.4 days), replacing the retired plasma-1-day.json."""
+    data = fetch_noaa_data("/json/rtsw/rtsw_wind_1m.json")
+    if data:
+        for entry in data:
+            entry['speed'] = entry.get('proton_speed')
+            entry['density'] = entry.get('proton_density')
+    return data
+
+def fetch_mag_data_extended():
+    """~31 days of hourly magnetometer history from the ACE archive, replacing the retired mag-3-day/7-day.json."""
+    return fetch_noaa_data("/json/ace/mag/ace_mag_1h.json")
+
+def fetch_plasma_data_extended():
+    """~31 days of hourly solar wind history from the ACE archive, replacing the retired plasma-3-day/7-day.json."""
+    data = fetch_noaa_data("/json/ace/swepam/ace_swepam_1h.json")
+    if data:
+        for entry in data:
+            entry['density'] = entry.get('dens')
+    return data
+
 def calculate_cme_arrival(cme_speed, distance_au=1.0):
     """Calculate approximate CME arrival time at Earth/geostationary orbit"""
     if cme_speed <= 0:
@@ -384,15 +438,58 @@ def calculate_affected_longitudes(cme_longitude, cme_width):
     # Handle None or invalid values
     if cme_longitude is None or cme_width is None:
         return (0, 360)  # Full coverage if unknown
-    
+
     # Convert solar longitude to geostationary longitude
     geo_center = -cme_longitude
     half_width = cme_width / 2.0
-    
+
     start_long = (geo_center - half_width) % 360
     end_long = (geo_center + half_width) % 360
-    
+
     return (start_long, end_long)
+
+def mercator_longitude_segments(center_longitude, width):
+    """Split the arc [center_longitude - width/2, center_longitude + width/2] into
+    one or more (start, end) pairs in -180..180 display coordinates for plotting on
+    a Prime-Meridian-centered Mercator map.
+
+    Fixes a bug in the old approach (independently wrapping start/end to -180..180
+    with `% 360` then comparing them) that broke down for arcs approaching or
+    crossing width=180: as width approaches 360 (a full-halo CME - common among
+    Earth-directed events, since is_earth_directed() favors half_angle >= 120,
+    i.e. width >= 240), start and end collapse toward the same value regardless of
+    the true width, so a CME that should span - and cross - the entire map instead
+    rendered as a zero-width sliver that never appeared to cross 180.
+
+    This works directly in unwrapped real-number space and only normalizes into
+    display coordinates once each piece is already confined to a single map copy,
+    so it's correct for any width from 0 to 360 and any number of edge crossings."""
+    if width is None or width <= 0:
+        return []
+    width = min(width, 360.0)  # can't physically exceed a full circle
+    raw_start = center_longitude - width / 2.0
+    raw_end = center_longitude + width / 2.0
+
+    # Cut the arc at every map edge (odd multiple of 180) it passes through
+    k_lo = int(np.floor((raw_start - 180) / 360)) - 1
+    k_hi = int(np.ceil((raw_end - 180) / 360)) + 1
+    cut_points = {raw_start, raw_end}
+    for k in range(k_lo, k_hi + 1):
+        edge = 180 + 360 * k
+        if raw_start < edge < raw_end:
+            cut_points.add(edge)
+    cuts = sorted(cut_points)
+
+    segments = []
+    for a, b in zip(cuts[:-1], cuts[1:]):
+        if b - a <= 1e-9:
+            continue
+        # Normalize using the segment's midpoint (guaranteed not to sit on an edge),
+        # then shift both endpoints by the same offset to preserve the true width
+        mid = (a + b) / 2.0
+        offset = ((mid + 180) % 360) - 180 - mid
+        segments.append((a + offset, b + offset))
+    return segments
 
 def plot_earth_3d(affected_start, affected_end, cme_time=None, title="Geostationary Impact Zone"):
     """Create 3D Earth visualization with affected longitude zones
@@ -1002,36 +1099,31 @@ with tab1:
     
     with col1:
         st.subheader("🧲 Magnetic Field")
-        mag_data_raw = fetch_noaa_data("/products/solar-wind/mag-1-day.json")
+        mag_data_raw = fetch_mag_data()
         log_api_call("NOAA SWPC", "Magnetic Field")
-        if mag_data_raw and isinstance(mag_data_raw, list) and len(mag_data_raw) > 1:
-            # Array format: [time, bx, by, bz, lon, lat, bt]
+        if mag_data_raw and isinstance(mag_data_raw, list) and len(mag_data_raw) > 0:
+            # New rtsw feed returns dicts ordered newest-first
             try:
-                latest_entry = mag_data_raw[-1]
-                bt = latest_entry[6] if len(latest_entry) > 6 else 'N/A'
+                latest_entry = mag_data_raw[0]
+                bt = latest_entry.get('bt', 'N/A')
                 st.metric("Magnetic Field Bt (Current)", f"{bt} nT")
                 st.caption("📊 [NOAA Solar Wind Magnetometer](https://www.swpc.noaa.gov)")
-            except (IndexError, TypeError):
+            except (IndexError, TypeError, AttributeError):
                 st.info("Fetching magnetic field data...")
         else:
             st.info("Fetching magnetic field data...")
-    
+
     with col2:
-        st.subheader("🌀 Solar Wind")  
-        sw_data = fetch_noaa_data("/products/solar-wind/plasma-1-day.json")
+        st.subheader("🌀 Solar Wind")
+        sw_data = fetch_plasma_data()
         log_api_call("NOAA SWPC", "Solar Wind")
-        if sw_data and isinstance(sw_data, list) and len(sw_data) > 1:
-            # NOAA returns array: [headers, data_row1, data_row2, ...]
-            # Most recent data is typically the last row
+        if sw_data and isinstance(sw_data, list) and len(sw_data) > 0:
+            # New rtsw feed returns dicts ordered newest-first
             try:
-                headers = sw_data[0]
-                latest_data = sw_data[-1]  # Get most recent reading
-                
-                # Find speed column index
-                if 'speed' in headers:
-                    speed_idx = headers.index('speed')
-                    speed = latest_data[speed_idx]
-                    
+                latest_data = sw_data[0]  # Most recent reading
+                speed = latest_data.get('speed')
+
+                if speed is not None:
                     # Validate speed value
                     try:
                         speed_val = float(speed)
@@ -1129,15 +1221,13 @@ with tab1:
     
     with col5:
         st.subheader("🌡️ Proton Density")
-        sw_data_density = fetch_noaa_data("/products/solar-wind/plasma-1-day.json")
+        sw_data_density = fetch_plasma_data()
         log_api_call("NOAA SWPC", "Proton Density")
-        if sw_data_density and isinstance(sw_data_density, list) and len(sw_data_density) > 1:
+        if sw_data_density and isinstance(sw_data_density, list) and len(sw_data_density) > 0:
             try:
-                headers = sw_data_density[0]
-                latest_data = sw_data_density[-1]
-                if 'density' in headers:
-                    density_idx = headers.index('density')
-                    density = latest_data[density_idx]
+                latest_data = sw_data_density[0]  # New rtsw feed returns dicts ordered newest-first
+                density = latest_data.get('density')
+                if density is not None:
                     try:
                         density_val = float(density)
                         if density_val > 0 and density_val < 1000:
@@ -1198,15 +1288,15 @@ with tab1:
     st.subheader("📈 Extended Historical Trends")
     
     with st.spinner("Loading historical data from multiple sources..."):
-        # Fetch data for each metric (using available NOAA endpoints)
-        # NOAA provides 1-day, 3-day, and 7-day JSON endpoints
-        mag_1d = fetch_noaa_data("/products/solar-wind/mag-1-day.json")
-        mag_3d = fetch_noaa_data("/products/solar-wind/mag-3-day.json")
-        mag_7d = fetch_noaa_data("/products/solar-wind/mag-7-day.json")
-        
-        plasma_1d = fetch_noaa_data("/products/solar-wind/plasma-1-day.json")
-        plasma_3d = fetch_noaa_data("/products/solar-wind/plasma-3-day.json")
-        plasma_7d = fetch_noaa_data("/products/solar-wind/plasma-7-day.json")
+        # Fetch data for each metric. NOAA retired the old 1-day/3-day/7-day mag and
+        # plasma products; the replacement is a near-real-time feed (~2.4 days) plus
+        # an hourly archive (~31 days) - see fetch_mag_data()/fetch_plasma_data() and
+        # their _extended() counterparts near the top of this file.
+        mag_recent = fetch_mag_data()
+        mag_extended = fetch_mag_data_extended()
+
+        plasma_recent = fetch_plasma_data()
+        plasma_extended = fetch_plasma_data_extended()
         
         # Use correct GOES X-ray endpoints
         xray_1d = fetch_noaa_data("/json/goes/primary/xrays-6-hour.json")
@@ -1260,22 +1350,25 @@ with tab1:
                 radio_combined_raw = [['time_tag', 'flux']]  # Headers
                 radio_combined_raw.extend(radio_data)  # Data rows
         
-        # Extract headers and combine data (skip first row which is headers)
-        mag_combined = []
-        mag_headers = None
-        for dataset in [mag_7d, mag_3d, mag_1d]:
-            if dataset and isinstance(dataset, list) and len(dataset) > 1:
-                if mag_headers is None:
-                    mag_headers = dataset[0]  # Save header from first dataset
-                mag_combined.extend(dataset[1:])  # Skip header row
-        
-        plasma_combined = []
-        plasma_headers = None
-        for dataset in [plasma_7d, plasma_3d, plasma_1d]:
-            if dataset and isinstance(dataset, list) and len(dataset) > 1:
-                if plasma_headers is None:
-                    plasma_headers = dataset[0]  # Save header from first dataset
-                plasma_combined.extend(dataset[1:])  # Skip header row
+        # Combine the extended archive with the near-real-time feed, then reshape from
+        # the new list-of-dicts format into the [headers, row1, row2, ...] array format
+        # the rest of this app builds its DataFrames from (drop_duplicates on time_tag
+        # downstream handles any overlap between the two sources).
+        mag_columns = ['time_tag', 'bt']
+        mag_raw = []
+        for dataset in [mag_extended, mag_recent]:
+            if dataset and isinstance(dataset, list):
+                mag_raw.extend(dataset)
+        mag_combined = [[entry.get(col) for col in mag_columns] for entry in mag_raw]
+        mag_headers = mag_columns if mag_combined else None
+
+        plasma_columns = ['time_tag', 'speed', 'density']
+        plasma_raw = []
+        for dataset in [plasma_extended, plasma_recent]:
+            if dataset and isinstance(dataset, list):
+                plasma_raw.extend(dataset)
+        plasma_combined = [[entry.get(col) for col in plasma_columns] for entry in plasma_raw]
+        plasma_headers = plasma_columns if plasma_combined else None
         
         xray_combined = []
         xray_headers = None
@@ -2323,7 +2416,12 @@ with tab2:
                         arrival_datetime = launch_datetime + timedelta(hours=arrival_hours)
                         duration_hours = estimate_impact_duration(cme_speed, cme_width)
                         long_start, long_end = calculate_affected_longitudes(cme_longitude, cme_width)
-                        
+                        # A full-halo CME (width >= 360) affects every longitude; long_start
+                        # and long_end collapse to the same value in that case, which would
+                        # otherwise misleadingly print as e.g. "180 - 180"
+                        is_full_halo = cme_width >= 359.9
+                        longitude_range_display = "0° - 360° (Full Halo)" if is_full_halo else f"{long_start:.0f}° - {long_end:.0f}°"
+
                         st.divider()
                         st.success("✅ CME Impact Analysis Complete")
                         
@@ -2340,8 +2438,7 @@ with tab2:
                                      delta=f"±{duration_hours*0.2:.1f} hrs uncertainty")
                         
                         with result_col3:
-                            st.metric("Affected Longitude Range", 
-                                     f"{long_start:.0f}° - {long_end:.0f}°")
+                            st.metric("Affected Longitude Range", longitude_range_display)
                         
                         st.subheader("📋 Impact Details")
                         
@@ -2358,7 +2455,8 @@ with tab2:
                                      f"{duration_hours:.1f} hours",
                                      arrival_datetime.strftime("%Y-%m-%d %H:%M UTC"),
                                      (arrival_datetime + timedelta(hours=duration_hours)).strftime("%Y-%m-%d %H:%M UTC"),
-                                     f"{long_start:.1f}° East", f"{long_end:.1f}° East"]
+                                     "All longitudes" if is_full_halo else f"{long_start:.1f}° East",
+                                     "All longitudes" if is_full_halo else f"{long_end:.1f}° East"]
                         }
                         
                         st.dataframe(pd.DataFrame(impact_info), use_container_width=True)
@@ -2394,20 +2492,20 @@ with tab2:
                 cme = cme_event['data']
                 arrival_time = cme['arrival_time']
                 
-                # Calculate affected longitude range
+                # Keep the raw center longitude and width (not pre-wrapped into a
+                # start/end pair) so the plotting code can split the arc correctly
+                # regardless of how wide it is - see mercator_longitude_segments()
                 longitude = float(cme.get('longitude', 0) or 0)
                 width = float(cme.get('width', 0) or 0)
-                long_start = (longitude - width / 2) % 360
-                long_end = (longitude + width / 2) % 360
-                
+
                 # Determine event classification
                 classification = cme['classification']
-                
+
                 timeline_events.append({
                     'arrival_time': arrival_time,
                     'end_time': arrival_time + timedelta(hours=24),  # Assume 24-hour duration
-                    'long_start': long_start,
-                    'long_end': long_end,
+                    'longitude': longitude,
+                    'width': width,
                     'speed': cme['speed'],
                     'classification': classification,
                     'scorer_class': classification.split('/')[0][:2] if '/' in classification else classification[:2] if len(classification) >= 2 else classification[0]
@@ -2478,54 +2576,23 @@ with tab2:
                         scorer_class = scorer_class[0]
                 
                 color = color_map.get(scorer_class, '#999999')
-                
-                # Get longitude span
-                long_start = event['long_start']
-                long_end = event['long_end']
-                
-                # Convert to -180 to 180
-                def convert_longitude(lon):
-                    lon = lon % 360
-                    if lon > 180:
-                        return lon - 360
-                    return lon
-                
-                long_start_merc = convert_longitude(long_start)
-                long_end_merc = convert_longitude(long_end)
-                
-                angular_span = (long_end - long_start) % 360
-                needs_wraparound = (long_start_merc > long_end_merc and angular_span < 180) or angular_span > 180
-                
-                if not needs_wraparound:
-                    if long_start_merc <= long_end_merc:
-                        width = long_end_merc - long_start_merc
-                    else:
-                        width = (180 - long_start_merc) + (long_end_merc + 180)
-                    
-                    rect = plt.Rectangle((long_start_merc, arrival_hours), width, duration_hours,
+
+                # Split the arc into one segment per map copy it touches - handles
+                # any width from 0 to 360 (including full-halo CMEs) without the
+                # zero-width collapse the old start/end-comparison approach hit
+                segments = mercator_longitude_segments(event['longitude'], event['width'])
+
+                center_y = arrival_hours + duration_hours / 2
+                label_x = None
+                for seg_start, seg_end in segments:
+                    rect = plt.Rectangle((seg_start, arrival_hours), seg_end - seg_start, duration_hours,
                                         facecolor=color, edgecolor='black', alpha=0.75, linewidth=2, zorder=5)
                     ax.add_patch(rect)
-                    
-                    center_x = (long_start_merc + long_end_merc) / 2
-                    center_y = arrival_hours + duration_hours / 2
-                    ax.text(center_x, center_y, f"{event['classification']}\n{event['speed']} km/s",
-                           ha='center', va='center', fontsize=9, fontweight='bold',
-                           bbox=dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.9, edgecolor='black'),
-                           zorder=10)
-                else:
-                    # Wraparound case
-                    width1 = 180 - long_start_merc
-                    rect1 = plt.Rectangle((long_start_merc, arrival_hours), width1, duration_hours,
-                                         facecolor=color, edgecolor='black', alpha=0.75, linewidth=2, zorder=5)
-                    ax.add_patch(rect1)
-                    
-                    width2 = long_end_merc - (-180)
-                    rect2 = plt.Rectangle((-180, arrival_hours), width2, duration_hours,
-                                         facecolor=color, edgecolor='black', alpha=0.75, linewidth=2, zorder=5)
-                    ax.add_patch(rect2)
-                    
-                    center_y = arrival_hours + duration_hours / 2
-                    ax.text(0, center_y, f"{event['classification']}\n{event['speed']} km/s",
+                    if label_x is None:
+                        label_x = (seg_start + seg_end) / 2
+
+                if label_x is not None:
+                    ax.text(label_x, center_y, f"{event['classification']}\n{event['speed']} km/s",
                            ha='center', va='center', fontsize=9, fontweight='bold',
                            bbox=dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.9, edgecolor='black'),
                            zorder=10)
@@ -2676,18 +2743,19 @@ with tab3:
                 min_time = min(current_time, min(arrival_times))
                 max_time = max(e['end_time'] for e in timeline_events)
                 
-                # Add CME longitude data for 3D visualization
+                # Add CME longitude data for 3D visualization. Keep the raw center
+                # longitude and width (not pre-wrapped into a start/end pair) so the
+                # plotting code can split the arc correctly regardless of how wide it
+                # is - see mercator_longitude_segments()
                 for idx, event in enumerate(timeline_events):
                     # Find matching CME from parsed data
                     matching_cme = next((c for c in parsed_timeline_cmes if c['id'] == event['cme_id']), None)
                     if matching_cme:
-                        long_start, long_end = calculate_affected_longitudes(
-                            matching_cme['longitude'], matching_cme['width'])
-                        event['long_start'] = long_start
-                        event['long_end'] = long_end
+                        event['longitude'] = matching_cme['longitude']
+                        event['width'] = matching_cme['width']
                     else:
-                        event['long_start'] = 0
-                        event['long_end'] = 360
+                        event['longitude'] = 0
+                        event['width'] = 360
                 
                 # Filter for future events only (after current time)
                 future_events = [e for e in timeline_events if e['arrival_time'] >= current_time]
@@ -2766,66 +2834,23 @@ with tab3:
                         if duration_hours <= 0:
                             continue
                         
-                        # Get longitude span (x-axis) - convert to -180 to 180 range
-                        long_start = event.get('long_start', 0)
-                        long_end = event.get('long_end', 360)
-                        
-                        # Convert from 0-360 to -180 to 180 (centered on Prime Meridian)
-                        def convert_longitude(lon):
-                            lon = lon % 360
-                            if lon > 180:
-                                return lon - 360
-                            return lon
-                        
-                        long_start_merc = convert_longitude(long_start)
-                        long_end_merc = convert_longitude(long_end)
-                        
-                        # Calculate the angular span in the original 0-360 space
-                        # This correctly handles wraparound
-                        angular_span = (long_end - long_start) % 360
-                        
-                        # Check if this wraps around in the -180/180 coordinate system
-                        # Wraparound occurs if the converted end is less than start (when span < 180)
-                        # OR if the angular span is very large (> 180 degrees)
-                        needs_wraparound = (long_start_merc > long_end_merc and angular_span < 180) or angular_span > 180
-                        
-                        if not needs_wraparound:
-                            # Normal case - single rectangle
-                            # The width should be the converted difference
-                            if long_start_merc <= long_end_merc:
-                                width = long_end_merc - long_start_merc
-                            else:
-                                # This shouldn't happen if logic is correct, but handle it
-                                width = (180 - long_start_merc) + (long_end_merc + 180)
-                            
-                            rect = plt.Rectangle((long_start_merc, arrival_hours), width, duration_hours,
+                        # Split the arc into one segment per map copy it touches -
+                        # handles any width from 0 to 360 (including full-halo CMEs)
+                        # without the zero-width collapse the old start/end-comparison
+                        # approach hit - see mercator_longitude_segments()
+                        segments = mercator_longitude_segments(event['longitude'], event['width'])
+
+                        center_y = arrival_hours + duration_hours / 2
+                        label_x = None
+                        for seg_start, seg_end in segments:
+                            rect = plt.Rectangle((seg_start, arrival_hours), seg_end - seg_start, duration_hours,
                                                 facecolor=color, edgecolor='black', alpha=0.75, linewidth=2, zorder=5)
                             ax.add_patch(rect)
-                            
-                            # Add label in center
-                            center_x = (long_start_merc + long_end_merc) / 2
-                            center_y = arrival_hours + duration_hours / 2
-                            ax.text(center_x, center_y, f"{event['classification']}\n{event['speed']} km/s",
-                                   ha='center', va='center', fontsize=9, fontweight='bold',
-                                   bbox=dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.9, edgecolor='black'),
-                                   zorder=10)
-                        else:
-                            # Wraparound case - two rectangles
-                            # Draw from long_start_merc to +180
-                            width1 = 180 - long_start_merc
-                            rect1 = plt.Rectangle((long_start_merc, arrival_hours), width1, duration_hours,
-                                                 facecolor=color, edgecolor='black', alpha=0.75, linewidth=2, zorder=5)
-                            ax.add_patch(rect1)
-                            
-                            # Draw from -180 to long_end_merc
-                            width2 = long_end_merc - (-180)
-                            rect2 = plt.Rectangle((-180, arrival_hours), width2, duration_hours,
-                                                 facecolor=color, edgecolor='black', alpha=0.75, linewidth=2, zorder=5)
-                            ax.add_patch(rect2)
-                            
-                            # Add label at Prime Meridian (0)
-                            center_y = arrival_hours + duration_hours / 2
-                            ax.text(0, center_y, f"{event['classification']}\n{event['speed']} km/s",
+                            if label_x is None:
+                                label_x = (seg_start + seg_end) / 2
+
+                        if label_x is not None:
+                            ax.text(label_x, center_y, f"{event['classification']}\n{event['speed']} km/s",
                                    ha='center', va='center', fontsize=9, fontweight='bold',
                                    bbox=dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.9, edgecolor='black'),
                                    zorder=10)
