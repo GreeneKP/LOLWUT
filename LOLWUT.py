@@ -93,65 +93,85 @@ def fetch_nasa_donki(url, params, max_retries=3, backoff_seconds=5):
 
 @st.cache_data(ttl=3600)
 def fetch_historical_cmes(days=90):
-    """Fetch historical CME data from NASA DONKI API"""
+    """Fetch historical CME data from NASA DONKI API.
+
+    Deliberately does NOT catch fetch errors here: st.cache_data caches whatever a
+    function returns, including None, but does NOT cache a raised exception. If this
+    swallowed errors and returned None on failure (as it used to), one unlucky failure
+    would get cached as "no data" for the full ttl (1 hour) across every tab that
+    calls it, making a transient NASA hiccup look like a much longer, broader outage
+    than it actually was. Letting the exception propagate means the next rerun tries
+    again fresh instead of replaying a stale failure. See fetch_historical_cmes_safe()
+    for the error-handling/UI wrapper actually used by the rest of the app."""
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days)
-    
+
     params = {
         'startDate': start_date.strftime('%Y-%m-%d'),
         'endDate': end_date.strftime('%Y-%m-%d'),
         'api_key': NASA_API_KEY
     }
-    
+
+    response = fetch_nasa_donki(NASA_DONKI_CME_API, params)
+    log_api_call(NASA_DONKI_CME_API)
+    return response.json()
+
+def fetch_historical_cmes_safe(days=90):
+    """Uncached wrapper around fetch_historical_cmes(): turns a failure into a
+    friendly message + None, without caching the failure itself for an hour."""
     try:
-        response = fetch_nasa_donki(NASA_DONKI_CME_API, params)
-        log_api_call(NASA_DONKI_CME_API)
-        data = response.json()
-        return data
+        return fetch_historical_cmes(days)
     except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 429:
+        if e.response is not None and e.response.status_code == 429:
             st.error("⚠️ **NASA API Rate Limit Exceeded!**")
             st.warning("""
             The DEMO_KEY is limited to 30 requests per hour.
-            
+
             **To fix this:**
             1. Get a FREE NASA API key at: https://api.nasa.gov
             2. Replace 'DEMO_KEY' on line 20 of this file with your key
             3. Your personal key allows 1,000 requests per hour!
-            
+
             **Temporary workaround:** Wait an hour and refresh the page.
             """)
-            return None
         else:
             st.error(f"HTTP Error fetching CME data: {str(e)}")
-            return None
+        return None
     except Exception as e:
         st.error(f"Error fetching CME data: {str(e)}")
         return None
+
 @st.cache_data(ttl=3600)
 def fetch_historical_flares(days=90):
-    """Fetch historical solar flare data from NASA DONKI API"""
+    """Fetch historical solar flare data from NASA DONKI API.
+
+    Deliberately does NOT catch fetch errors here - see fetch_historical_cmes() for
+    why: a cached function must not swallow errors into a cached None. Use
+    fetch_historical_flares_safe() instead of calling this directly."""
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days)
-    
+
     params = {
         'startDate': start_date.strftime('%Y-%m-%d'),
         'endDate': end_date.strftime('%Y-%m-%d'),
         'api_key': NASA_API_KEY
     }
-    
+
+    response = fetch_nasa_donki(NASA_DONKI_FLR_API, params)
+    log_api_call(NASA_DONKI_FLR_API)
+    return response.json()
+
+def fetch_historical_flares_safe(days=90):
+    """Uncached wrapper around fetch_historical_flares(): turns a failure into a
+    friendly message + None, without caching the failure itself for an hour."""
     try:
-        response = fetch_nasa_donki(NASA_DONKI_FLR_API, params)
-        log_api_call(NASA_DONKI_FLR_API)
-        data = response.json()
-        return data
+        return fetch_historical_flares(days)
     except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 429:
+        if e.response is not None and e.response.status_code == 429:
             st.info("⚠️ Solar flare data rate limited. Using CME data only.")
-            return None
         else:
             st.error(f"HTTP Error fetching flare data: {str(e)}")
-            return None
+        return None
     except Exception as e:
         st.error(f"Error fetching flare data: {str(e)}")
         return None
@@ -2088,8 +2108,8 @@ with tab2:
     
     # Fetch both CME and flare data
     with st.spinner("Loading historical solar event data from NASA DONKI..."):
-        cme_data = fetch_historical_cmes(90)
-        flare_data = fetch_historical_flares(90)
+        cme_data = fetch_historical_cmes_safe(90)
+        flare_data = fetch_historical_flares_safe(90)
     
     # Check if we got rate limited
     if cme_data is None and flare_data is None:
@@ -2696,8 +2716,8 @@ with tab3:
     
     # Fetch CME and flare data for timeline
     with st.spinner("Building CME impact timeline..."):
-        cme_timeline_data = fetch_historical_cmes(90)
-        flare_timeline_data = fetch_historical_flares(90)
+        cme_timeline_data = fetch_historical_cmes_safe(90)
+        flare_timeline_data = fetch_historical_flares_safe(90)
     
     if cme_timeline_data:
         parsed_timeline_cmes = parse_cme_data(cme_timeline_data, flare_timeline_data)
