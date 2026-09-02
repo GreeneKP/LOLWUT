@@ -27,7 +27,7 @@ SWPC_BASE_URL = "https://services.swpc.noaa.gov"
 NASA_DONKI_CME_API = "https://api.nasa.gov/DONKI/CME"
 NASA_DONKI_FLR_API = "https://api.nasa.gov/DONKI/FLR"
 
-# NASA API Key - Get your FREE key at: https://api.nasa.gov
+# NASA API Key - we can get another FREE key at: https://api.nasa.gov
 # DEMO_KEY is limited to 30 requests per hour per IP
 # Replace with your personal key for 1000 requests per hour
 NASA_API_KEY = "W8g4oXP8B1XPG2kO291e0zfmZk6ol4h0gCwAsjO5"
@@ -453,14 +453,35 @@ def estimate_impact_duration(cme_speed, cme_width):
     
     return max(6, min(duration, 48))
 
-def calculate_affected_longitudes(cme_longitude, cme_width):
-    """Calculate which geostationary longitudes will be affected"""
+def subsolar_longitude_at(t):
+    """Geostationary longitude directly facing the Sun at time t (UTC) - 0 deg
+    (Prime Meridian) at solar noon, moving westward 15 deg/hour as Earth rotates."""
+    if t is None:
+        return 0.0
+    hours_since_noon = (t.hour - 12) + t.minute / 60.0 + t.second / 3600.0
+    return -hours_since_noon * 15.0
+
+def cme_geo_center_longitude(cme_longitude, arrival_time=None):
+    """Geostationary longitude most directly facing a CME's source direction at
+    the given time.
+
+    A CME's transit takes anywhere from ~15 hours (very fast, >2000 km/s) to
+    several days (slow, <400 km/s) - long enough for Earth to complete one or
+    more full rotations before the CME arrives. So "which longitude does this
+    CME hit" is only meaningful evaluated AT ARRIVAL TIME, not at the moment of
+    eruption: passing None here (as calculate_affected_longitudes() used to do
+    unconditionally) silently assumes arrival always happens at solar noon over
+    the Prime Meridian, which is essentially never true."""
+    return subsolar_longitude_at(arrival_time) - cme_longitude
+
+def calculate_affected_longitudes(cme_longitude, cme_width, arrival_time=None):
+    """Calculate which geostationary longitudes will be affected, evaluated at
+    arrival_time (see cme_geo_center_longitude() for why that matters)."""
     # Handle None or invalid values
     if cme_longitude is None or cme_width is None:
         return (0, 360)  # Full coverage if unknown
 
-    # Convert solar longitude to geostationary longitude
-    geo_center = -cme_longitude
+    geo_center = cme_geo_center_longitude(cme_longitude, arrival_time)
     half_width = cme_width / 2.0
 
     start_long = (geo_center - half_width) % 360
@@ -574,23 +595,8 @@ def plot_earth_3d(affected_start, affected_end, cme_time=None, title="Geostation
         ax.plot(line_x, line_y, line_z, 'k--', alpha=0.5, linewidth=1)
     
     # Add Sun direction indicator based on CME arrival time at geostationary belt
-    # The subsolar point (where sun is directly overhead) rotates as Earth rotates
-    # At 12:00 UTC (noon), the subsolar point is at 0° longitude (Prime Meridian)
-    # Earth rotates eastward at 15° per hour, so subsolar point appears to move westward
-    if cme_time is not None:
-        # Calculate hours since noon UTC (12:00)
-        hours_since_noon = (cme_time.hour - 12) + cme_time.minute / 60.0 + cme_time.second / 3600.0
-        
-        # Subsolar point moves westward at 15° per hour
-        # At 13:00 UTC (1 hour after noon), subsolar point is at -15° (15° west of Prime Meridian)
-        subsolar_longitude = -hours_since_noon * 15.0
-        
-        # The sun direction vector should point toward the subsolar point
-        # (this is where the sun is in the sky relative to Earth)
-        sun_longitude = subsolar_longitude
-    else:
-        # Default: point toward Prime Meridian (as if it were noon)
-        sun_longitude = 0.0
+    # (subsolar_longitude_at() defaults to 0 deg / Prime Meridian when cme_time is None)
+    sun_longitude = subsolar_longitude_at(cme_time)
     
     sun_distance = 10
     sun_rad = np.radians(sun_longitude)
@@ -2435,7 +2441,7 @@ with tab2:
                         
                         arrival_datetime = launch_datetime + timedelta(hours=arrival_hours)
                         duration_hours = estimate_impact_duration(cme_speed, cme_width)
-                        long_start, long_end = calculate_affected_longitudes(cme_longitude, cme_width)
+                        long_start, long_end = calculate_affected_longitudes(cme_longitude, cme_width, arrival_time=arrival_datetime)
                         # A full-halo CME (width >= 360) affects every longitude; long_start
                         # and long_end collapse to the same value in that case, which would
                         # otherwise misleadingly print as e.g. "180 - 180"
@@ -2597,10 +2603,14 @@ with tab2:
                 
                 color = color_map.get(scorer_class, '#999999')
 
-                # Split the arc into one segment per map copy it touches - handles
-                # any width from 0 to 360 (including full-halo CMEs) without the
-                # zero-width collapse the old start/end-comparison approach hit
-                segments = mercator_longitude_segments(event['longitude'], event['width'])
+                # Convert solar source longitude to geostationary longitude, evaluated
+                # at this CME's own arrival time (Earth keeps rotating during transit -
+                # see cme_geo_center_longitude()), then split the arc into one segment
+                # per map copy it touches - handles any width from 0 to 360 (including
+                # full-halo CMEs) without the zero-width collapse the old
+                # start/end-comparison approach hit
+                geo_center = cme_geo_center_longitude(event['longitude'], event['arrival_time'])
+                segments = mercator_longitude_segments(geo_center, event['width'])
 
                 center_y = arrival_hours + duration_hours / 2
                 label_x = None
@@ -2854,11 +2864,14 @@ with tab3:
                         if duration_hours <= 0:
                             continue
                         
-                        # Split the arc into one segment per map copy it touches -
-                        # handles any width from 0 to 360 (including full-halo CMEs)
-                        # without the zero-width collapse the old start/end-comparison
-                        # approach hit - see mercator_longitude_segments()
-                        segments = mercator_longitude_segments(event['longitude'], event['width'])
+                        # Convert solar source longitude to geostationary longitude,
+                        # evaluated at this CME's own arrival time (Earth keeps rotating
+                        # during transit - see cme_geo_center_longitude()), then split
+                        # the arc into one segment per map copy it touches - handles any
+                        # width from 0 to 360 (including full-halo CMEs) without the
+                        # zero-width collapse the old start/end-comparison approach hit
+                        geo_center = cme_geo_center_longitude(event['longitude'], event['arrival_time'])
+                        segments = mercator_longitude_segments(geo_center, event['width'])
 
                         center_y = arrival_hours + duration_hours / 2
                         label_x = None
