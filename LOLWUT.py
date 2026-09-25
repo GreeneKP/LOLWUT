@@ -1380,11 +1380,21 @@ with tab1:
         # the new list-of-dicts format into the [headers, row1, row2, ...] array format
         # the rest of this app builds its DataFrames from (drop_duplicates on time_tag
         # downstream handles any overlap between the two sources).
+        def last_7_days(entries):
+            """Keep only entries within 7 days of the newest time_tag."""
+            # format='ISO8601' because the archive and real-time feeds format time_tag differently
+            times = pd.to_datetime([e.get('time_tag') for e in entries], utc=True, errors='coerce', format='ISO8601')
+            if times.isna().all():
+                return entries
+            cutoff = times.max() - timedelta(days=7)
+            return [e for e, t in zip(entries, times) if pd.notna(t) and t >= cutoff]
+
         mag_columns = ['time_tag', 'bt']
         mag_raw = []
         for dataset in [mag_extended, mag_recent]:
             if dataset and isinstance(dataset, list):
                 mag_raw.extend(dataset)
+        mag_raw = last_7_days(mag_raw)
         mag_combined = [[entry.get(col) for col in mag_columns] for entry in mag_raw]
         mag_headers = mag_columns if mag_combined else None
 
@@ -1393,6 +1403,7 @@ with tab1:
         for dataset in [plasma_extended, plasma_recent]:
             if dataset and isinstance(dataset, list):
                 plasma_raw.extend(dataset)
+        plasma_raw = last_7_days(plasma_raw)
         plasma_combined = [[entry.get(col) for col in plasma_columns] for entry in plasma_raw]
         plasma_headers = plasma_columns if plasma_combined else None
         
@@ -2983,8 +2994,11 @@ with tab3:
                     # Define SCORER severity order (highest to lowest)
                     scorer_severity = {'E': 5, 'R': 4, 'O': 3, 'C': 2, 'S': 1}
                     # Only check future events that are actually shown on the graph (within 7 days)
-                    max_severity = max(future_events, key=lambda x: scorer_severity.get(x['classification'][0], 0))
-                    st.metric("Highest Severity Event", max_severity['classification'])
+                    if future_events:
+                        max_severity = max(future_events, key=lambda x: scorer_severity.get(x['classification'][0], 0))
+                        st.metric("Highest Severity Event", max_severity['classification'])
+                    else:
+                        st.metric("Highest Severity Event", "No CMEs forecasted")
             else:
                 st.info("No CME impact events calculated from available data")
         else:
