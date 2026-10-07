@@ -24,8 +24,11 @@ st.markdown("Real-time solar flares and coronal mass ejections tracking")
 
 # API Configuration
 SWPC_BASE_URL = "https://services.swpc.noaa.gov"
-NASA_DONKI_CME_API = "https://api.nasa.gov/DONKI/CME"
-NASA_DONKI_FLR_API = "https://api.nasa.gov/DONKI/FLR"
+# DONKI moved on 2026-09-30 (https://ccmc.gsfc.nasa.gov/news/major-updates). The old api.nasa.gov/DONKI
+# and kauai.ccmc.gsfc.nasa.gov addresses now just redirect to a news page. The new API needs no key
+# and rejects requests that include api_key.
+NASA_DONKI_CME_API = "https://ccmc.gsfc.nasa.gov/DONKI-API/get/CME"
+NASA_DONKI_FLR_API = "https://ccmc.gsfc.nasa.gov/DONKI-API/get/FLR"
 
 # NASA API Key - we can get another FREE key at: https://api.nasa.gov
 # DEMO_KEY is limited to 30 requests per hour per IP
@@ -62,8 +65,8 @@ def display_endpoint_link(feature_name):
     if feature_name in st.session_state.feature_endpoints:
         endpoint = st.session_state.feature_endpoints[feature_name]
         # Format endpoint as clickable link for NASA API or display as text for NOAA
-        if 'api.nasa.gov' in endpoint:
-            st.caption(f"📊 Data source: [{endpoint}]({endpoint}?api_key={NASA_API_KEY})")
+        if 'DONKI-API' in endpoint:
+            st.caption(f"📊 Data source: [{endpoint}]({endpoint})")
         else:
             st.caption(f"📊 Data source: `{endpoint}`")
     else:
@@ -80,6 +83,10 @@ def fetch_nasa_donki(url, params, max_retries=3, backoff_seconds=5):
         try:
             response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
+            # A moved endpoint can redirect to an ordinary web page; fail clearly instead of
+            # letting response.json() blow up later with "Expecting value: line 1 column 1"
+            if 'json' not in response.headers.get('Content-Type', ''):
+                raise ValueError(f"DONKI returned a web page instead of data (ended up at {response.url}); the API address may have changed")
             return response
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 429:
@@ -90,6 +97,24 @@ def fetch_nasa_donki(url, params, max_retries=3, backoff_seconds=5):
         if attempt < max_retries - 1:
             time.sleep(backoff_seconds)
     raise last_exception
+
+def fetch_donki_range(url, days):
+    """Fetch the last `days` days of DONKI events. The new DONKI API refuses any single
+    request spanning more than 60 days, so longer ranges are fetched in back-to-back
+    chunks (oldest first) and joined into one chronological list."""
+    end_date = datetime.now().date()
+    chunk_start = end_date - timedelta(days=days)
+    events = []
+    while chunk_start <= end_date:
+        chunk_end = min(chunk_start + timedelta(days=59), end_date)
+        params = {
+            'startDate': chunk_start.strftime('%Y-%m-%d'),
+            'endDate': chunk_end.strftime('%Y-%m-%d'),
+        }
+        response = fetch_nasa_donki(url, params)
+        events.extend(response.json() or [])
+        chunk_start = chunk_end + timedelta(days=1)
+    return events
 
 @st.cache_data(ttl=3600)
 def fetch_historical_cmes(days=90):
@@ -103,18 +128,9 @@ def fetch_historical_cmes(days=90):
     than it actually was. Letting the exception propagate means the next rerun tries
     again fresh instead of replaying a stale failure. See fetch_historical_cmes_safe()
     for the error-handling/UI wrapper actually used by the rest of the app."""
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days)
-
-    params = {
-        'startDate': start_date.strftime('%Y-%m-%d'),
-        'endDate': end_date.strftime('%Y-%m-%d'),
-        'api_key': NASA_API_KEY
-    }
-
-    response = fetch_nasa_donki(NASA_DONKI_CME_API, params)
+    data = fetch_donki_range(NASA_DONKI_CME_API, days)
     log_api_call(NASA_DONKI_CME_API)
-    return response.json()
+    return data
 
 def fetch_historical_cmes_safe(days=90):
     """Uncached wrapper around fetch_historical_cmes(): turns a failure into a
@@ -148,18 +164,9 @@ def fetch_historical_flares(days=90):
     Deliberately does NOT catch fetch errors here - see fetch_historical_cmes() for
     why: a cached function must not swallow errors into a cached None. Use
     fetch_historical_flares_safe() instead of calling this directly."""
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days)
-
-    params = {
-        'startDate': start_date.strftime('%Y-%m-%d'),
-        'endDate': end_date.strftime('%Y-%m-%d'),
-        'api_key': NASA_API_KEY
-    }
-
-    response = fetch_nasa_donki(NASA_DONKI_FLR_API, params)
+    data = fetch_donki_range(NASA_DONKI_FLR_API, days)
     log_api_call(NASA_DONKI_FLR_API)
-    return response.json()
+    return data
 
 def fetch_historical_flares_safe(days=90):
     """Uncached wrapper around fetch_historical_flares(): turns a failure into a
@@ -2700,7 +2707,7 @@ with tab2:
             plt.tight_layout()
             st.pyplot(fig)
             plt.close()
-            st.caption("📊 [NASA DONKI CME Database](https://api.nasa.gov/DONKI/CME)")
+            st.caption("📊 [NASA DONKI CME Database](https://ccmc.gsfc.nasa.gov/DONKI/)")
         else:
             st.info("Select a CME event to view its impact forecast")
     
@@ -2965,7 +2972,7 @@ with tab3:
                     plt.tight_layout()
                     st.pyplot(fig)
                     plt.close()
-                    st.caption("📊 [NASA DONKI CME Database](https://api.nasa.gov/DONKI/CME)")
+                    st.caption("📊 [NASA DONKI CME Database](https://ccmc.gsfc.nasa.gov/DONKI/)")
                     
                     st.caption("📊 **How to read this chart:** Each colored box shows when (vertical span) and where (horizontal span) CMEs will impact the geostationary belt. " +
                               "| 💙 Blue line at bottom = NOW | " +
